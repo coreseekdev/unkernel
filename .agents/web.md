@@ -900,11 +900,9 @@ external buffer), else as wl_shm windows (frames read back).
   `vkd3d-demos` (vkd3d 1.2: `/usr/bin/vkd3d-gears`, `vkd3d-triangle`;
   with libvkd3d1, libvkd3d-shader1 and libvkd3d-utils1 about 230 kB to
   download, 880 KiB installed) and the Xwayland packages (`xwl.ts`): the
-  demos are xcb only, so each runs on a rootful Xwayland of its window's
-  size (300x300, 640x480) with no window manager (`XWL_NO_WM=1`), its
-  frames read back and put with XPutImage (vk.md, Presentation). The
-  gears' X screen is black (`gears.sh`), since the page's window for it
-  is 320 wide. vkd3d makes four pipelines at start-up that WebGPU cannot
+  demos are xcb only, so each window is a window of the page through
+  xwayland-satellite, its frames read back and put with XPutImage
+  (vk.md, Presentation). vkd3d makes four pipelines at start-up that WebGPU cannot
   run (texel buffers, 1D-array storage images) and the demos never bind:
   kwvk prints a "cannot run on WebGPU" line for each, and the row counts
   them as renderer errors; the README they print first says these are
@@ -1432,8 +1430,10 @@ answered at the kernel's next yield.
   mesa-utils; `needs.wayland`) runs `es2gears_wayland` after `eglinfo -B
   -p wayland`; its README suggests glmark2-es2-wayland and
   gtk4-widget-factory (GTK 4). Other Wayland apps are in the Browsers,
-  Desktop, Games, Media and Tools groups: SDL games (what they share: `apps/sdlwl.ts`), X11 apps in
-  one rootful Xwayland window with twm (`apps/xwl.ts`). Started from the
+  Desktop, Games, Media and Tools groups: SDL games (what they share: `apps/sdlwl.ts`), X11 apps
+  each a window of its own through xwayland-satellite (Fedora 43's
+  aarch64 build; `apps/xwl.ts`), except Xfce's, one rootful Xwayland
+  window (`XWL_ROOTFUL`). Started from the
   launcher, a Wayland app's terminal is its log (`launcher.ts`): its tab
   opens selected, as any app's, and shows until the app's window maps and
   takes the focus (with `terminal: "window"` its own Terminal window is
