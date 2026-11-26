@@ -48,9 +48,13 @@ Done in this tree:
 - **Remaining phase 2 work:** Alpine's dynamic loader starts but faults
   (the x86-64 dynamic ELF path and the loader's own emulation still need
   work); Debian's static BusyBox reaches its shell but an applet command
-  (`true`, `uname`) still crashes in `ash`'s applet/lookup path after the
-  libc SSE2 `strnlen`/`memchr` fixes, so a static BusyBox rootfs is not
-  yet usable. x86-64 ptrace regsets and core-dump notes are not
+  (`true`, `uname`) still crashes in `ash`'s applet/lookup path. The
+  immediate cause is glibc's aligned `__strcmp_sse2`: it returns 0 for
+  some unequal pairs (`"abc"`/`"abd"`; `__strcmp_sse2_unaligned` is
+  correct), so `ash` reads the token `true` as `then`. The emulator's
+  handling of that function's alignment/jump-table path is the remaining
+  bug. The harness's `getcwd`, `rt_sigaction` query and `prctl` are
+  implemented so the same path can be reproduced under `kwemu-harness-x86`. x86-64 ptrace regsets and core-dump notes are not
   implemented (`HAVE_ARCH_TRACEHOOK` stays off for x86); x87 is a precise
   #UD; the decoded-op tier and wasm JIT are phase 4; riscv64 is phase 3.
 

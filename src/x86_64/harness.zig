@@ -63,6 +63,7 @@ const EINVAL = 22;
 const ENOTTY = 25;
 const ESPIPE = 29;
 const ENOSYS = 38;
+const ERANGE = 34;
 
 pub const Stats = struct {
     syscalls: u64 = 0,
@@ -490,7 +491,12 @@ pub const Machine = struct {
                 for ([_][]const u8{ "Linux", "kwemu", "6.12.0", "#1", "x86_64", "localdomain" }, 0..) |str, i| @memcpy(u[i * 65 ..][0..str.len], str);
                 break :blk if (m.copyOut(a[0], &u)) 0 else neg(EFAULT);
             },
-            79 => neg(ENOENT), // getcwd (unused fallback)
+            79 => blk: { // getcwd: the root of the guest tree
+                if (a[0] == 0) break :blk neg(EINVAL);
+                if (a[1] < 2) break :blk neg(ERANGE);
+                if (!m.copyOut(a[0], "/\x00")) break :blk neg(EFAULT);
+                break :blk 2;
+            },
             89, 257, 262, 267 => neg(ENOENT), // openat/fstatat/newfstatat/readlinkat
             96 => blk: { // gettimeofday
                 const ns = m.now();
