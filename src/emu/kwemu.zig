@@ -136,6 +136,7 @@ const mark_wild = std.math.maxInt(u64);
 
 const a64_state = @import("../a64/state.zig");
 const a64_tier = @import("../a64/tier.zig");
+const x86_state = @import("../x86_64/state.zig");
 /// One slot of the op arena; the ISA views the arena as its own 16-byte
 /// op type (`opArena`).
 pub const Slot = extern struct { lo: u64, hi: u64 };
@@ -269,6 +270,10 @@ const Priv = extern struct {
     jit: jc.State,
     /// A64 (src/a64): exclusive-monitor extras, enabled features.
     a64: a64_state.Priv,
+    /// x86-64 (src/x86_64): enabled features and profiler stops. Present in
+    /// every build (it is only 24 bytes of the opaque area) so that the
+    /// ISA-neutral cache code never depends on the guest ISA.
+    x86_64: x86_state.Priv,
 };
 
 inline fn hostLoad(comptime T: type, addr: u64) T {

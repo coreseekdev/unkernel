@@ -12,7 +12,8 @@ Run the row for what you changed, and no more.
 
 | Change | Quick check |
 | --- | --- |
-| Emulator (`src/`, `test/guest/`, `include/`) | `zig build test` |
+| Emulator (`src/`, `test/guest/`, `include/`) | `zig build test` (it needs Node 24: the wasm64/table64 runners fail to compile the modules on Node 22) |
+| x86-64 CPU (`src/x86_64/`) | `zig build test-x86-64` (native unit tests); `node test/x86-64-test.mjs zig-out` (the static x86-64 guests, native and wasm64, against qemu-x86_64 when it is on PATH); `zig build -Dkw-user-isa=x86_64` for the x86-64 wasm64 object and harness; `KW_USER_ISA=x86_64 kernel/build.sh kernel` for the x86-64 kernel (`vendor/build/kernel-x86_64/`), then `node js/cli.ts --kernel vendor/build/kernel-x86_64/vmlinux --initrd FILE --append "console=hvc0 rdinit=/init"` |
 | Kernel, `kw_emu.h`, JIT | `kernel/build.sh kernel`; `node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"` (`kwtest: 0 failure(s)`, exit 0); for JIT changes, again with `--no-jit` |
 | JIT control flow, regions, budget or polls | the row above; `zig build test -Dkwemu-a64-fuzz=20000` (the A64 block fuzz; a64/jit.md) |
 | Base initramfs, kw layer, distro images (`guest/`) | `KW_BASE_OUT=/tmp/b kernel/build.sh base`, `KW_BASE_OUT=/tmp/b KW_DISTRO_OUT=/tmp/d guest/build.sh distro`, then `UNKERNEL_TEST_BASE_KERNEL=/tmp/b/unkernel.wasm UNKERNEL_TEST_DISTRO_DIR=/tmp/d pnpm test:distro` and `UNKERNEL_TEST_KERNEL=/tmp/b/unkernel.wasm UNKERNEL_TEST_DISTRO_DIR=/tmp/d pnpm test:api` (or the same in place: `kernel/build.sh base`, `kernel/build.sh distro`, `pnpm test:distro`, `pnpm test:api`); `UNKERNEL_TEST_DISTRO_FORMAT=ext4` for the ext4 images; optional: `node js/cli.ts --timeout 120 --input '{8}uname -a; apk --version\n{2}poweroff\n'` |
@@ -41,7 +42,8 @@ events and the CLI's `--display`, `--sound-wav` and `--worker`.
 
 To add a test: for the emulator, a unit test in `src/a64/tests.zig` or a
 guest in `test/guest/a64/` plus entries in `build.zig` (`a64_guests`) and
-`test/a64-test.mjs`; for the kernel, a `CHECK(...)` in
+`test/a64-test.mjs`; the x86-64 CPU mirrors that with `src/x86_64/tests.zig`,
+`test/guest/x86_64/`, `x86_guests` and `test/x86-64-test.mjs`; for the kernel, a `CHECK(...)` in
 `guest/src/test/kwtest.c`. A separate static guest program goes into
 `guest/src/`, the `tools` list of `guest/base/build.sh` and the table
 in `guest/src/kwbox.c` (the layer's tools are one program), or into

@@ -7,13 +7,15 @@
  * guest registers in a kernel-owned struct kw_regs (normally inside the
  * task's pt_regs).
  *
- * Guest ISA: AArch64, A64 instruction set, ARMv8.0-A user mode (EL0),
- * little-endian, with FP and AdvSIMD. No SVE, pointer authentication or
- * MTE; the PAC and BTI encodings in the hint space run as NOPs. The crypto
- * extensions, LSE atomics, SHA-512 and SHA-3 are optional features
- * (KW_ISA_*, below), enabled only when this build implements them.
- * .agents/a64.md lists which instructions are implemented; every other
- * encoding raises KW_EV_ILLEGAL.
+ * Guest ISA: selected at build time. By default AArch64, A64 instruction
+ * set, ARMv8.0-A user mode (EL0), little-endian, with FP and AdvSIMD. No
+ * SVE, pointer authentication or MTE; the PAC and BTI encodings in the
+ * hint space run as NOPs. The crypto extensions, LSE atomics, SHA-512 and
+ * SHA-3 are optional features (KW_ISA_*, below), enabled only when this
+ * build implements them. A build with KW_USER_ISA_X86_64 has an x86-64
+ * user mode instead (the integer baseline and SSE2; see src/x86_64 and
+ * HANDOFF.md), using the x86-64 struct kw_regs below. Every other encoding
+ * raises KW_EV_ILLEGAL.
  *
  * Memory model: kernel and emulator share one wasm64 linear memory. A
  * "physical address" is a linear-memory address minus cpu->phys_base.
@@ -83,6 +85,14 @@ extern "C" {
 #define KW_ABI_VERSION 4
 
 /*
+ * The register state of one task depends on the guest ISA the emulator was
+ * built for (the build-time KW_USER_ISA, compile-time selected here with
+ * KW_USER_ISA_X86_64). Both layouts are fixed; a kernel bundle and a
+ * kwemu build of the same ISA use the one below, and a bundle never mixes
+ * them.
+ */
+#ifndef KW_USER_ISA_X86_64
+/*
  * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
  * at 0, sp 248, pc 256, nzcv 264, fpcr 268, fpsr 272, tpidr_el0 280, and
  * the 32 128-bit V registers at 288 (16-byte aligned; each is two
@@ -102,20 +112,53 @@ struct kw_regs {
 	uint64_t tpidr_el0;
 	uint64_t v[32][2] __attribute__((aligned(16)));
 } __attribute__((aligned(16)));
+#else
+/*
+ * x86-64 register state of one task. The first 27 words are Linux's
+ * `struct user_regs_struct` in its order (ptrace can expose them as is):
+ * r15 r14 r13 r12 rbp rbx r11 r10 r9 r8 rax rcx rdx rsi rdi orig_rax rip
+ * cs eflags rsp ss fs_base gs_base ds es fs gs. `rip` is the pc and the
+ * event's with-register state; `eflags` holds the architectural RFLAGS
+ * (bit 1 reads as 1). fs_base/gs_base are the segment bases TLS uses; the
+ * ds/es/fs/gs selectors are kept only because user_regs_struct has them.
+ * Then mxcsr and the 16 128-bit XMM registers (16-byte aligned, the memory
+ * image of a little-endian __uint128_t).
+ */
+struct kw_regs {
+	uint64_t r15, r14, r13, r12, rbp, rbx;
+	uint64_t r11, r10, r9, r8;
+	uint64_t rax, rcx, rdx, rsi, rdi;
+	uint64_t orig_rax, rip, cs, eflags, rsp, ss;
+	uint64_t fs_base, gs_base, ds, es, fs, gs;
+	uint32_t mxcsr;    /* MXCSR as LDMXCSR/STMXCSR see it */
+	uint32_t _pad;
+	uint64_t xmm[16][2] __attribute__((aligned(16)));
+} __attribute__((aligned(16)));
+#endif
 
 enum kw_event_kind {
 	KW_EV_BUDGET = 0,      /* instruction budget used up (timer tick point) */
-	KW_EV_SYSCALL = 1,     /* SVC #imm (any imm); pc already past it; the
-				  number is in x8, the arguments in x0..x5 */
+	KW_EV_SYSCALL = 1,     /* SVC #imm (any imm), or SYSCALL on x86-64;
+				  pc already past it; A64: number in x8,
+				  arguments in x0..x5; x86-64: number in
+				  rax, arguments in rdi rsi rdx r10 r8 r9,
+				  rcx/r11 already hold the return rip and
+				  flags */
 	KW_EV_FAULT = 2,       /* page fault; pc at the faulting instruction */
 	KW_EV_ILLEGAL = 3,     /* unallocated or unimplemented encoding, UDF,
 				  HLT, HVC, SMC, a system register EL0 may not
-				  access; pc at it, ev.insn = the raw word */
-	KW_EV_BREAKPOINT = 4,  /* BRK #imm; pc at it, ev.insn = the raw word */
-	KW_EV_MISALIGNED = 5,  /* pc not 4-byte aligned (ev.addr = pc), or an
+				  access (x86-64: #UD, e.g. x87 or an
+				  unadvertised extension); pc at it,
+				  ev.insn = the raw word (first bytes on
+				  x86-64) */
+	KW_EV_BREAKPOINT = 4,  /* BRK #imm, or INT3 on x86-64; pc at it,
+				  ev.insn = the raw word */
+	KW_EV_MISALIGNED = 5,  /* pc not 4-byte aligned (ev.addr = pc), an
 				  exclusive or acquire/release access that is
-				  not naturally aligned (ev.addr = the
-				  address); pc at the instruction */
+				  not naturally aligned, or an x86-64 aligned
+				  SSE access on an unaligned address
+				  (ev.addr = the address); pc at the
+				  instruction */
 	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
 };
 
@@ -172,7 +215,9 @@ void kw_cpu_init(struct kw_cpu *cpu);
  * taken branch out of a block (a branch the decoder followed
  * inside a page is not a check point). Every event leaves regs (incl. pc)
  * exactly at an instruction boundary. Data accesses may be unaligned
- * (SCTLR_EL1.A = 0); SP alignment is not checked.
+ * (SCTLR_EL1.A = 0); SP alignment is not checked. x86-64: instruction
+ * fetch requires an executable mapping, and an aligned SSE access on an
+ * unaligned address is KW_EV_MISALIGNED.
  */
 uint32_t kw_run(struct kw_cpu *cpu, struct kw_regs *regs);
 

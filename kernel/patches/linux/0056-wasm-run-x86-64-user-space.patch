@@ -1,0 +1,1427 @@
+From 1786d29392c0582609de617d23a0c5f86bedcee8 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Thu, 26 Nov 2026 22:33:16 +0800
+Subject: [PATCH] wasm: run x86-64 user space
+
+kwemu's guest CPU can be x86-64 (include/kw_emu.h with
+KW_USER_ISA_X86_64). Present the x86-64 Linux user ABI, selected at build
+time with CONFIG_WASM_USER_X86_64 (AArch64 stays the default):
+
+- syscalls: rax = number/return, rdi rsi rdx r10 r8 r9 = arguments,
+  arch/x86/entry/syscalls/syscall_64.tbl without x32, the x86 clone order
+  (no CLONE_BACKWARDS), arch_prctl for FS/GS bases, and the selector and
+  port syscalls as the errors a real kernel gives;
+- ELF: EM_X86_64, AT_PLATFORM "x86_64", x86-64 CPUID EDX as AT_HWCAP,
+  uname -m x86_64; /proc/cpuinfo in x86's format;
+- process: child rax = 0, CLONE_SETTLS sets the FS base, exec starts with
+  RFLAGS.IF and the flat user segments, and show_regs dumps the x86 GPRs;
+- signals: x86-64's rt_sigframe (pretcode with SA_RESTORER, ucontext,
+  siginfo and an FXSAVE area), sigreturn restores the GPRs, RIP/RSP,
+  RFLAGS, FS/GS bases, MXCSR and XMM registers, and syscall restart
+  rewinds by the two SYSCALL bytes;
+- page tables stay Sv48 and TASK_SIZE becomes the 47-bit user range;
+- ptrace regsets, core dumps, seccomp filters and the sigpage remain
+  arm64's (the x86 layouts are the next step).
+
+A static x86-64 init reaches user mode, calls arch_prctl and readlink,
+and powers the kernel off.
+---
+ arch/wasm/Kconfig                       |  26 +-
+ arch/wasm/Makefile                      |  12 +-
+ arch/wasm/configs/kw_x86.config         |   3 +
+ arch/wasm/include/asm/elf.h             |  29 ++-
+ arch/wasm/include/asm/kw_emu.h          |  75 ++++--
+ arch/wasm/include/asm/processor.h       |  10 +
+ arch/wasm/include/asm/ptrace.h          |  37 ++-
+ arch/wasm/include/asm/seccomp.h         |  11 +-
+ arch/wasm/include/asm/syscall.h         |  65 ++++-
+ arch/wasm/include/asm/syscall_wrapper.h |   7 +
+ arch/wasm/include/asm/unistd.h          |  14 ++
+ arch/wasm/include/uapi/asm/prctl.h      |  14 ++
+ arch/wasm/kernel/Makefile.syscalls      |  11 +-
+ arch/wasm/kernel/cpu.c                  |  35 +++
+ arch/wasm/kernel/process.c              |  35 ++-
+ arch/wasm/kernel/prof.c                 |   8 +-
+ arch/wasm/kernel/ptrace.c               |  31 +++
+ arch/wasm/kernel/signal.c               | 302 ++++++++++++++++++++++++
+ arch/wasm/kernel/sys.c                  |  56 +++++
+ arch/wasm/kernel/syscall_table.c        |   9 +-
+ arch/wasm/kernel/traps.c                |  44 +++-
+ arch/wasm/mm/fault.c                    |   6 +-
+ arch/wasm/mm/sigpage.c                  |   7 +
+ 23 files changed, 795 insertions(+), 52 deletions(-)
+ create mode 100644 arch/wasm/configs/kw_x86.config
+ create mode 100644 arch/wasm/include/uapi/asm/prctl.h
+
+diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
+index ec1eda88f..7114e5e10 100644
+--- a/arch/wasm/Kconfig
++++ b/arch/wasm/Kconfig
+@@ -2,6 +2,21 @@
+ 
+ menu "Wasm-specific options"
+ 
++choice
++	prompt "User-mode ABI"
++	default WASM_USER_AARCH64
++	help
++	  The Linux user ABI kwemu presents. The kernel, its page tables and
++	  devices are the same; the guest CPU, the syscall table, the signal
++	  frames and the ptrace layouts follow this choice.
++
++config WASM_USER_AARCH64
++	bool "AArch64 (arm64)"
++
++config WASM_USER_X86_64
++	bool "x86-64"
++endchoice
++
+ #
+ # Execution model (unkernel): the kernel is a single Wasm instance running
+ # on one host thread. Kernel tasks are separate Wasm stacks switched with JSPI
+@@ -16,13 +31,12 @@ config WASM
+ 	default y
+ 	select ARCH_NO_PREEMPT
+ 	# arm64 user ABI: clone(flags, newsp, ptid, tls, ctid), as on arm64.
+-	# arm64's other ABI selects are for compat (AArch32) or BTI/GNU
+-	# property notes, which this port does not have.
+-	select CLONE_BACKWARDS
+-	# seccomp filters see AUDIT_ARCH_AARCH64 and arm64's syscall numbers.
++	# x86-64 uses the mainline order (flags, newsp, ptid, ctid, tls).
++	select CLONE_BACKWARDS if WASM_USER_AARCH64
++	# seccomp filters see AUDIT_ARCH_AARCH64 or AUDIT_ARCH_X86_64.
+ 	select HAVE_ARCH_SECCOMP_FILTER
+-	# ptrace's regsets (arm64's), PTRACE_GET_SYSCALL_INFO, /proc/PID/syscall
+-	select HAVE_ARCH_TRACEHOOK
++	# ptrace's arm64 regsets; x86-64 brings its own up later.
++	select HAVE_ARCH_TRACEHOOK if WASM_USER_AARCH64
+ 	select HAVE_VIRT_CPU_ACCOUNTING_GEN
+ 	select HAVE_CONTEXT_TRACKING_USER
+ 
+diff --git a/arch/wasm/Makefile b/arch/wasm/Makefile
+index 8512b7e3c..1b2fd3352 100644
+--- a/arch/wasm/Makefile
++++ b/arch/wasm/Makefile
+@@ -2,8 +2,16 @@
+ 
+ KBUILD_DEFCONFIG := kw_defconfig
+ 
+-# User mode is arm64.
+-UTS_MACHINE := aarch64
++# User mode: arm64 by default, x86-64 with CONFIG_WASM_USER_X86_64.
++UTS_MACHINE := $(if $(CONFIG_WASM_USER_X86_64),x86_64,aarch64)
++# The header-generation sub-make (scripts/Makefile.asm-headers) does not
++# inherit auto.conf's variables unless they are exported; it chooses the
++# syscall table from this one.
++export CONFIG_WASM_USER_X86_64
++
++ifeq ($(CONFIG_WASM_USER_X86_64),y)
++KBUILD_CFLAGS += -DKW_USER_ISA_X86_64
++endif
+ 
+ KCFLAGS += -nostdlib -fno-builtin
+ KCFLAGS += -march=wasm64
+diff --git a/arch/wasm/configs/kw_x86.config b/arch/wasm/configs/kw_x86.config
+new file mode 100644
+index 000000000..04b6aa19a
+--- /dev/null
++++ b/arch/wasm/configs/kw_x86.config
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# x86-64 user mode (kernel/build.sh KW_USER_ISA=x86_64).
++CONFIG_WASM_USER_X86_64=y
+diff --git a/arch/wasm/include/asm/elf.h b/arch/wasm/include/asm/elf.h
+index fc3631e5a..afb978c5c 100644
+--- a/arch/wasm/include/asm/elf.h
++++ b/arch/wasm/include/asm/elf.h
+@@ -4,8 +4,10 @@
+ #define _ASM_WASM_ELF_H
+ 
+ /*
+- * User mode is arm64 (AArch64, little-endian, LP64): this mirrors
+- * arch/arm64/include/asm/elf.h without compat (AArch32) and without a vDSO.
++ * User mode is arm64 (AArch64, little-endian, LP64) by default, mirroring
++ * arch/arm64/include/asm/elf.h without compat (AArch32) and without a vDSO;
++ * CONFIG_WASM_USER_X86_64 presents the x86-64 ELF ABI instead
++ * (arch/x86/include/asm/elf.h, without compat or a vDSO).
+  */
+ 
+ #include <uapi/linux/elf.h>
+@@ -16,25 +18,42 @@
+ 
+ typedef unsigned long elf_greg_t;
+ 
++#ifdef CONFIG_WASM_USER_X86_64
++#define ELF_NGREG	27
++typedef elf_greg_t elf_gregset_t[ELF_NGREG];
++typedef struct { u32 cwd, swd, twd, fop, fip, fcs, foo, fos; u8 st[80]; u32 mxcsr, mxcsr_mask; u8 xmm[256]; } elf_fpregset_t;
++
++#define ELF_ARCH	EM_X86_64
++#else
+ #define ELF_NGREG (sizeof(struct user_pt_regs) / sizeof(elf_greg_t))
+ typedef elf_greg_t elf_gregset_t[ELF_NGREG];
+ typedef struct user_fpsimd_state elf_fpregset_t;
+ 
+ #define ELF_ARCH	EM_AARCH64
++#endif
+ #define ELF_CLASS	ELFCLASS64
+ #define ELF_DATA	ELFDATA2LSB
+ 
++#ifdef CONFIG_WASM_USER_X86_64
++#define elf_check_arch(x) (((x)->e_machine == EM_X86_64) && \
++			   ((x)->e_ident[EI_CLASS] == ELF_CLASS))
++#else
+ #define elf_check_arch(x) (((x)->e_machine == EM_AARCH64) && \
+ 			   ((x)->e_ident[EI_CLASS] == ELF_CLASS))
++#endif
+ 
+ #define ELF_EXEC_PAGESIZE	(PAGE_SIZE)
+ #define ELF_ET_DYN_BASE		((DEFAULT_MAP_WINDOW / 3) * 2)
+ #define STACK_RND_MASK		(0x3ffff >> (PAGE_SHIFT - 12))
+ 
+ #define ELF_PLATFORM_SIZE	16
++#ifdef CONFIG_WASM_USER_X86_64
++#define ELF_PLATFORM		("x86_64")
++#else
+ #define ELF_PLATFORM		("aarch64")
++#endif
+ 
+-/* cpu.c: FP, ASIMD and what kw_set_isa() enabled; nothing in HWCAP2/3. */
++/* cpu.c: arm64 HWCAP, or x86-64's CPUID features in EDX form. */
+ #define ELF_HWCAP		(kw_elf_hwcap)
+ #define ELF_HWCAP2		(0UL)
+ #define ELF_HWCAP3		(0UL)
+@@ -52,6 +71,7 @@ struct linux_binprm;
+ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
+ 				       int uses_interp);
+ 
++#ifdef CONFIG_WASM_USER_AARCH64
+ /* Core dump notes come from the ptrace regsets (ptrace.c), as on arm64. */
+ #define CORE_DUMP_USE_REGSET
+ 
+@@ -64,6 +84,9 @@ do {									\
+ 	__d->pc = (regs)->user.pc;					\
+ 	__d->pstate = (regs)->user.nzcv;				\
+ } while (0);
++#else
++/* x86-64 core dumps wait for its regsets; the generic notes are enough. */
++#endif
+ 
+ #define SET_PERSONALITY(ex) \
+ 	set_personality(PER_LINUX | (current->personality & (~PER_MASK)))
+diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
+index 7db679113..455f76335 100644
+--- a/arch/wasm/include/asm/kw_emu.h
++++ b/arch/wasm/include/asm/kw_emu.h
+@@ -7,13 +7,15 @@
+  * guest registers in a kernel-owned struct kw_regs (normally inside the
+  * task's pt_regs).
+  *
+- * Guest ISA: AArch64, A64 instruction set, ARMv8.0-A user mode (EL0),
+- * little-endian, with FP and AdvSIMD. No SVE, pointer authentication or
+- * MTE; the PAC and BTI encodings in the hint space run as NOPs. The crypto
+- * extensions, LSE atomics, SHA-512 and SHA-3 are optional features
+- * (KW_ISA_*, below), enabled only when this build implements them.
+- * .agents/a64.md lists which instructions are implemented; every other
+- * encoding raises KW_EV_ILLEGAL.
++ * Guest ISA: selected at build time. By default AArch64, A64 instruction
++ * set, ARMv8.0-A user mode (EL0), little-endian, with FP and AdvSIMD. No
++ * SVE, pointer authentication or MTE; the PAC and BTI encodings in the
++ * hint space run as NOPs. The crypto extensions, LSE atomics, SHA-512 and
++ * SHA-3 are optional features (KW_ISA_*, below), enabled only when this
++ * build implements them. A build with KW_USER_ISA_X86_64 has an x86-64
++ * user mode instead (the integer baseline and SSE2; see src/x86_64 and
++ * HANDOFF.md), using the x86-64 struct kw_regs below. Every other encoding
++ * raises KW_EV_ILLEGAL.
+  *
+  * Memory model: kernel and emulator share one wasm64 linear memory. A
+  * "physical address" is a linear-memory address minus cpu->phys_base.
+@@ -82,6 +84,14 @@ extern "C" {
+ 
+ #define KW_ABI_VERSION 4
+ 
++/*
++ * The register state of one task depends on the guest ISA the emulator was
++ * built for (the build-time KW_USER_ISA, compile-time selected here with
++ * KW_USER_ISA_X86_64). Both layouts are fixed; a kernel bundle and a
++ * kwemu build of the same ISA use the one below, and a bundle never mixes
++ * them.
++ */
++#ifndef KW_USER_ISA_X86_64
+ /*
+  * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
+  * at 0, sp 248, pc 256, nzcv 264, fpcr 268, fpsr 272, tpidr_el0 280, and
+@@ -102,20 +112,53 @@ struct kw_regs {
+ 	uint64_t tpidr_el0;
+ 	uint64_t v[32][2] __attribute__((aligned(16)));
+ } __attribute__((aligned(16)));
++#else
++/*
++ * x86-64 register state of one task. The first 27 words are Linux's
++ * `struct user_regs_struct` in its order (ptrace can expose them as is):
++ * r15 r14 r13 r12 rbp rbx r11 r10 r9 r8 rax rcx rdx rsi rdi orig_rax rip
++ * cs eflags rsp ss fs_base gs_base ds es fs gs. `rip` is the pc and the
++ * event's with-register state; `eflags` holds the architectural RFLAGS
++ * (bit 1 reads as 1). fs_base/gs_base are the segment bases TLS uses; the
++ * ds/es/fs/gs selectors are kept only because user_regs_struct has them.
++ * Then mxcsr and the 16 128-bit XMM registers (16-byte aligned, the memory
++ * image of a little-endian __uint128_t).
++ */
++struct kw_regs {
++	uint64_t r15, r14, r13, r12, rbp, rbx;
++	uint64_t r11, r10, r9, r8;
++	uint64_t rax, rcx, rdx, rsi, rdi;
++	uint64_t orig_rax, rip, cs, eflags, rsp, ss;
++	uint64_t fs_base, gs_base, ds, es, fs, gs;
++	uint32_t mxcsr;    /* MXCSR as LDMXCSR/STMXCSR see it */
++	uint32_t _pad;
++	uint64_t xmm[16][2] __attribute__((aligned(16)));
++} __attribute__((aligned(16)));
++#endif
+ 
+ enum kw_event_kind {
+ 	KW_EV_BUDGET = 0,      /* instruction budget used up (timer tick point) */
+-	KW_EV_SYSCALL = 1,     /* SVC #imm (any imm); pc already past it; the
+-				  number is in x8, the arguments in x0..x5 */
++	KW_EV_SYSCALL = 1,     /* SVC #imm (any imm), or SYSCALL on x86-64;
++				  pc already past it; A64: number in x8,
++				  arguments in x0..x5; x86-64: number in
++				  rax, arguments in rdi rsi rdx r10 r8 r9,
++				  rcx/r11 already hold the return rip and
++				  flags */
+ 	KW_EV_FAULT = 2,       /* page fault; pc at the faulting instruction */
+ 	KW_EV_ILLEGAL = 3,     /* unallocated or unimplemented encoding, UDF,
+ 				  HLT, HVC, SMC, a system register EL0 may not
+-				  access; pc at it, ev.insn = the raw word */
+-	KW_EV_BREAKPOINT = 4,  /* BRK #imm; pc at it, ev.insn = the raw word */
+-	KW_EV_MISALIGNED = 5,  /* pc not 4-byte aligned (ev.addr = pc), or an
++				  access (x86-64: #UD, e.g. x87 or an
++				  unadvertised extension); pc at it,
++				  ev.insn = the raw word (first bytes on
++				  x86-64) */
++	KW_EV_BREAKPOINT = 4,  /* BRK #imm, or INT3 on x86-64; pc at it,
++				  ev.insn = the raw word */
++	KW_EV_MISALIGNED = 5,  /* pc not 4-byte aligned (ev.addr = pc), an
+ 				  exclusive or acquire/release access that is
+-				  not naturally aligned (ev.addr = the
+-				  address); pc at the instruction */
++				  not naturally aligned, or an x86-64 aligned
++				  SSE access on an unaligned address
++				  (ev.addr = the address); pc at the
++				  instruction */
+ 	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
+ };
+ 
+@@ -172,7 +215,9 @@ void kw_cpu_init(struct kw_cpu *cpu);
+  * taken branch out of a block (a branch the decoder followed
+  * inside a page is not a check point). Every event leaves regs (incl. pc)
+  * exactly at an instruction boundary. Data accesses may be unaligned
+- * (SCTLR_EL1.A = 0); SP alignment is not checked.
++ * (SCTLR_EL1.A = 0); SP alignment is not checked. x86-64: instruction
++ * fetch requires an executable mapping, and an aligned SSE access on an
++ * unaligned address is KW_EV_MISALIGNED.
+  */
+ uint32_t kw_run(struct kw_cpu *cpu, struct kw_regs *regs);
+ 
+diff --git a/arch/wasm/include/asm/processor.h b/arch/wasm/include/asm/processor.h
+index 037570583..49afcca46 100644
+--- a/arch/wasm/include/asm/processor.h
++++ b/arch/wasm/include/asm/processor.h
+@@ -16,7 +16,12 @@
+  * numerically; they are different address spaces (user memory is only
+  * reachable through page-table walks).
+  */
++#ifdef CONFIG_WASM_USER_X86_64
++/* x86-64 canonical user addresses: 47 bits, as on Linux x86-64. */
++#define TASK_SIZE		(_AC(1, UL) << 47)
++#else
+ #define TASK_SIZE		(_AC(1, UL) << 48)
++#endif
+ #define TASK_SIZE_MAX		TASK_SIZE
+ #define DEFAULT_MAP_WINDOW	TASK_SIZE
+ #define STACK_TOP		TASK_SIZE
+@@ -83,8 +88,13 @@ static inline unsigned long __get_wchan(struct task_struct *p)
+ #define task_pt_regs(task) \
+ 	((struct pt_regs *)(task_stack_page(task) + THREAD_SIZE) - 1)
+ 
++#ifdef CONFIG_WASM_USER_X86_64
++#define KSTK_EIP(tsk)	(task_pt_regs(tsk)->user.rip)
++#define KSTK_ESP(tsk)	(task_pt_regs(tsk)->user.rsp)
++#else
+ #define KSTK_EIP(tsk)	(task_pt_regs(tsk)->user.pc)
+ #define KSTK_ESP(tsk)	(task_pt_regs(tsk)->user.sp)
++#endif
+ 
+ #endif /* __ASSEMBLER__ */
+ 
+diff --git a/arch/wasm/include/asm/ptrace.h b/arch/wasm/include/asm/ptrace.h
+index 1e8b9a762..481adfb23 100644
+--- a/arch/wasm/include/asm/ptrace.h
++++ b/arch/wasm/include/asm/ptrace.h
+@@ -11,8 +11,10 @@
+ 
+ /*
+  * Kernel entry frame. For user tasks it sits at the top of the kernel stack
+- * and holds the arm64 user context run by kwemu. Frames for interrupts
+- * taken while in the kernel (idle) are built on the stack with kernel=1.
++ * and holds the user context run by kwemu (arm64 or x86-64, selected at
++ * build time; the layout of `user` is include/kw_emu.h's). Frames for
++ * interrupts taken while in the kernel (idle) are built on the stack with
++ * kernel=1.
+  */
+ struct pt_regs {
+ 	struct kw_regs user;	/* x0..x30, sp, pc, nzcv, fpcr, fpsr, tpidr_el0, v0..v31 */
+@@ -25,7 +27,11 @@ struct pt_regs {
+ };
+ 
+ #define PT_CAUSE_NONE		(-1UL)
++#ifdef CONFIG_WASM_USER_X86_64
++#define PT_CAUSE_SYSCALL	0x200UL	/* a marker, not an exception class */
++#else
+ #define PT_CAUSE_SYSCALL	0x15UL	/* like arm64 ESR_ELx_EC_SVC64 */
++#endif
+ 
+ /* syscall_get_nr() outside a syscall; also the syscall a tracer skips. */
+ #define NO_SYSCALL		(-1)
+@@ -35,6 +41,32 @@ struct pt_regs {
+ #define KW_FPSR_MASK	((1U << 27) | (1U << 7) | 0x1fU)
+ 
+ #define user_mode(regs)			(!(regs)->kernel)
++
++#ifdef CONFIG_WASM_USER_X86_64
++#define instruction_pointer(regs)	((regs)->user.rip)
++#define user_stack_pointer(regs)	((regs)->user.rsp)
++#define profile_pc(regs)		instruction_pointer(regs)
++
++static inline void instruction_pointer_set(struct pt_regs *regs,
++					   unsigned long val)
++{
++	regs->user.rip = val;
++}
++
++static inline unsigned long regs_return_value(struct pt_regs *regs)
++{
++	return regs->user.rax;
++}
++
++static inline void regs_set_return_value(struct pt_regs *regs,
++					 unsigned long val)
++{
++	regs->user.rax = val;
++}
++
++/* x86-64 exposes no regsets yet (HAVE_ARCH_TRACEHOOK is off). */
++#define arch_has_single_step()		(0)
++#else
+ #define instruction_pointer(regs)	((regs)->user.pc)
+ #define user_stack_pointer(regs)	((regs)->user.sp)
+ #define profile_pc(regs)		instruction_pointer(regs)
+@@ -58,6 +90,7 @@ static inline void regs_set_return_value(struct pt_regs *regs,
+ 
+ /* In software: user_mode_loop() runs one instruction per kw_run(). */
+ #define arch_has_single_step()		(1)
++#endif
+ 
+ #define current_pt_regs()		task_pt_regs(current)
+ #define current_user_stack_pointer()	user_stack_pointer(current_pt_regs())
+diff --git a/arch/wasm/include/asm/seccomp.h b/arch/wasm/include/asm/seccomp.h
+index 184470417..35057bdf4 100644
+--- a/arch/wasm/include/asm/seccomp.h
++++ b/arch/wasm/include/asm/seccomp.h
+@@ -1,7 +1,8 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ /*
+- * seccomp for the arm64 user ABI (as arch/arm64, without compat): filters
+- * see AUDIT_ARCH_AARCH64 and arm64's syscall numbers. SECCOMP_ARCH_NATIVE
++ * seccomp for the selected user ABI (arm64 by default, x86-64 with
++ * CONFIG_WASM_USER_X86_64): filters see that arch's audit value and
++ * syscall numbers. SECCOMP_ARCH_NATIVE
+  * turns on the per-filter cache of syscalls that are always allowed, so
+  * those skip the BPF interpreter (the arch has no BPF JIT).
+  */
+@@ -10,8 +11,14 @@
+ 
+ #include <asm-generic/seccomp.h>
+ 
++#ifdef CONFIG_WASM_USER_X86_64
++#define SECCOMP_ARCH_NATIVE		AUDIT_ARCH_X86_64
++#define SECCOMP_ARCH_NATIVE_NR		NR_syscalls
++#define SECCOMP_ARCH_NATIVE_NAME	"x86_64"
++#else
+ #define SECCOMP_ARCH_NATIVE		AUDIT_ARCH_AARCH64
+ #define SECCOMP_ARCH_NATIVE_NR		NR_syscalls
+ #define SECCOMP_ARCH_NATIVE_NAME	"aarch64"
++#endif
+ 
+ #endif /* _ASM_WASM_SECCOMP_H */
+diff --git a/arch/wasm/include/asm/syscall.h b/arch/wasm/include/asm/syscall.h
+index 4c3e07741..c8ae7c49f 100644
+--- a/arch/wasm/include/asm/syscall.h
++++ b/arch/wasm/include/asm/syscall.h
+@@ -9,9 +9,9 @@
+ #include <asm/ptrace.h>
+ 
+ /*
+- * arm64 syscall convention: x8 = nr, x0..x5 = args, x0 = return. As on
+- * arm64 the number in progress is kept apart from x8 (pt_regs syscallno,
+- * NT_ARM_SYSTEM_CALL), and the first argument in orig_x0.
++ * arm64 syscall convention: x8 = nr, x0..x5 = args, x0 = return. x86-64:
++ * rax = nr/return, rdi rsi rdx r10 r8 r9 = args. In both the number in
++ * progress is kept in pt_regs syscallno and the first argument in orig_x0.
+  */
+ 
+ typedef long (*syscall_t)(const struct pt_regs *);
+@@ -28,6 +28,64 @@ static inline void syscall_set_nr(struct task_struct *task,
+ 	regs->syscallno = sysno;
+ }
+ 
++#ifdef CONFIG_WASM_USER_X86_64
++static inline void syscall_rollback(struct task_struct *task,
++				    struct pt_regs *regs)
++{
++	regs->user.rax = regs->orig_x0;
++}
++
++static inline long syscall_get_error(struct task_struct *task,
++				     struct pt_regs *regs)
++{
++	unsigned long error = regs->user.rax;
++
++	return IS_ERR_VALUE(error) ? error : 0;
++}
++
++static inline long syscall_get_return_value(struct task_struct *task,
++					    struct pt_regs *regs)
++{
++	return regs->user.rax;
++}
++
++static inline void syscall_set_return_value(struct task_struct *task,
++					    struct pt_regs *regs,
++					    int error, long val)
++{
++	regs->user.rax = (long)error ?: val;
++}
++
++static inline void syscall_get_arguments(struct task_struct *task,
++					 struct pt_regs *regs,
++					 unsigned long *args)
++{
++	args[0] = regs->orig_x0;
++	args[1] = regs->user.rsi;
++	args[2] = regs->user.rdx;
++	args[3] = regs->user.r10;
++	args[4] = regs->user.r8;
++	args[5] = regs->user.r9;
++}
++
++static inline void syscall_set_arguments(struct task_struct *task,
++					 struct pt_regs *regs,
++					 const unsigned long *args)
++{
++	regs->orig_x0 = args[0];
++	regs->user.rdi = args[0];
++	regs->user.rsi = args[1];
++	regs->user.rdx = args[2];
++	regs->user.r10 = args[3];
++	regs->user.r8 = args[4];
++	regs->user.r9 = args[5];
++}
++
++static inline int syscall_get_arch(struct task_struct *task)
++{
++	return AUDIT_ARCH_X86_64;
++}
++#else
+ static inline void syscall_rollback(struct task_struct *task,
+ 				    struct pt_regs *regs)
+ {
+@@ -84,6 +142,7 @@ static inline int syscall_get_arch(struct task_struct *task)
+ {
+ 	return AUDIT_ARCH_AARCH64;
+ }
++#endif
+ 
+ static inline bool arch_syscall_is_vdso_sigreturn(struct pt_regs *regs)
+ {
+diff --git a/arch/wasm/include/asm/syscall_wrapper.h b/arch/wasm/include/asm/syscall_wrapper.h
+index 70d2ae0ba..6fb05f04b 100644
+--- a/arch/wasm/include/asm/syscall_wrapper.h
++++ b/arch/wasm/include/asm/syscall_wrapper.h
+@@ -17,10 +17,17 @@ asmlinkage long __wasm_sys_ni_syscall(const struct pt_regs *);
+ 	static long __se_##prefix##name(__MAP(x,__SC_LONG,__VA_ARGS__));		\
+ 	static long __se_##prefix##name(__MAP(x,__SC_LONG,__VA_ARGS__))
+ 
++#ifdef CONFIG_WASM_USER_X86_64
++#define SC_WASM_REGS_TO_ARGS(nargs, ...)						\
++	__MAP(nargs,__SC_ARGS								\
++	      ,,regs->orig_x0,,regs->user.rsi,,regs->user.rdx			\
++	      ,,regs->user.r10,,regs->user.r8,,regs->user.r9,,regs->user.r9)
++#else
+ #define SC_WASM_REGS_TO_ARGS(nargs, ...)						\
+ 	__MAP(nargs,__SC_ARGS								\
+ 	      ,,regs->orig_x0,,regs->user.x[1],,regs->user.x[2]			\
+ 	      ,,regs->user.x[3],,regs->user.x[4],,regs->user.x[5],,regs->user.x[6])
++#endif
+ 
+ #define __SYSCALL_DEFINEx(x, name, ...)						\
+ 	asmlinkage long __wasm_sys##name(const struct pt_regs *regs);		\
+diff --git a/arch/wasm/include/asm/unistd.h b/arch/wasm/include/asm/unistd.h
+index 0c377ee8f..681d8af18 100644
+--- a/arch/wasm/include/asm/unistd.h
++++ b/arch/wasm/include/asm/unistd.h
+@@ -2,9 +2,23 @@
+ #ifndef _ASM_WASM_UNISTD_H
+ #define _ASM_WASM_UNISTD_H
+ 
++#ifdef CONFIG_WASM_USER_X86_64
++/* The old and non-standard entries arch/x86/entry/syscalls/syscall_64.tbl has. */
++#define __ARCH_WANT_NEW_STAT
++#define __ARCH_WANT_SYS_ALARM
++#define __ARCH_WANT_SYS_FADVISE64
++#define __ARCH_WANT_SYS_GETPGRP
++#define __ARCH_WANT_SYS_PAUSE
++#define __ARCH_WANT_SYS_TIME
++#define __ARCH_WANT_SYS_UTIME
++#define __ARCH_WANT_SYS_FORK
++#define __ARCH_WANT_SYS_VFORK
++#define __ARCH_WANT_SYS_CLONE
++#else
+ /* Same set of wants as arm64 (no compat): user mode sees the arm64 syscall ABI. */
+ #define __ARCH_WANT_SYS_CLONE
+ #define __ARCH_WANT_NEW_STAT
++#endif
+ 
+ #include <uapi/asm/unistd.h>
+ 
+diff --git a/arch/wasm/include/uapi/asm/prctl.h b/arch/wasm/include/uapi/asm/prctl.h
+new file mode 100644
+index 000000000..cf19aa607
+--- /dev/null
++++ b/arch/wasm/include/uapi/asm/prctl.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_ASM_WASM_PRCTL_H
++#define _UAPI_ASM_WASM_PRCTL_H
++
++/* x86-64 arch_prctl() controls. Only the FS and GS bases exist here. */
++#define ARCH_SET_GS		0x1001
++#define ARCH_SET_FS		0x1002
++#define ARCH_GET_FS		0x1003
++#define ARCH_GET_GS		0x1004
++
++#define ARCH_GET_CPUID		0x1011
++#define ARCH_SET_CPUID		0x1012
++
++#endif /* _UAPI_ASM_WASM_PRCTL_H */
+diff --git a/arch/wasm/kernel/Makefile.syscalls b/arch/wasm/kernel/Makefile.syscalls
+index 1f43de853..78abfe8ad 100644
+--- a/arch/wasm/kernel/Makefile.syscalls
++++ b/arch/wasm/kernel/Makefile.syscalls
+@@ -1,6 +1,11 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+-# unkernel presents the arm64 Linux syscall ABI to user mode
+-# (arch/arm64/kernel/Makefile.syscalls; arm64's syscall_64.tbl is
+-# scripts/syscall.tbl).
++# unkernel presents arm64's Linux syscall ABI by default (arch/arm64/
++# kernel/Makefile.syscalls; arm64's syscall_64.tbl is scripts/syscall.tbl).
++# x86-64 uses arch/x86/entry/syscalls/syscall_64.tbl, without the x32 ABI.
++ifeq ($(CONFIG_WASM_USER_X86_64),y)
++syscalltbl := $(srctree)/arch/x86/entry/syscalls/syscall_64.tbl
++syscall_abis_64 := common,64
++else
+ syscall_abis_64 += renameat rlimit memfd_secret
++endif
+diff --git a/arch/wasm/kernel/cpu.c b/arch/wasm/kernel/cpu.c
+index ef54fc246..d3b7d158b 100644
+--- a/arch/wasm/kernel/cpu.c
++++ b/arch/wasm/kernel/cpu.c
+@@ -113,6 +113,17 @@ early_param("kw.isa", kw_isa_param);
+ /* Called once at boot, after kw_cpu_init and before any user code runs. */
+ void __init kw_isa_init(struct kw_cpu *cpu)
+ {
++#ifdef CONFIG_WASM_USER_X86_64
++	/*
++	 * The x86-64 baseline has no optional KW_ISA_* features; AT_HWCAP is
++	 * CPUID.1:EDX as x86-64 Linux reports it (FPU, TSC, CX8, CMOV, SSE,
++	 * SSE2). The rest of the CPUID leaves come from kwemu's CPUID.
++	 */
++	kw_set_isa(cpu, 0);
++	kw_elf_hwcap = (1UL << 0) | (1UL << 4) | (1UL << 8) |
++		       (1UL << 15) | (1UL << 25) | (1UL << 26);
++	pr_info("kwemu: x86-64 user mode, HWCAP %#lx\n", kw_elf_hwcap);
++#else
+ 	char *p = kw_isa_str, *end = kw_isa_str + sizeof(kw_isa_str);
+ 	unsigned long hwcap = 0;
+ 	u64 got;
+@@ -136,6 +147,7 @@ void __init kw_isa_init(struct kw_cpu *cpu)
+ 	kw_elf_hwcap = hwcap;
+ 	pr_info("kwemu: features %s (kwemu implements %#llx, enabled %#llx)\n",
+ 		kw_isa_str, kw_isa_supported(), got);
++#endif
+ }
+ 
+ #ifdef CONFIG_PROC_FS
+@@ -171,6 +183,28 @@ static int c_show(struct seq_file *m, void *v)
+ {
+ 	unsigned long cpu_id = (unsigned long)v - 1;
+ 
++#ifdef CONFIG_WASM_USER_X86_64
++	/* x86-64's format, for kwemu's CPUID signature (6/6/3). */
++	seq_printf(m, "processor\t: %lu\n", cpu_id);
++	seq_puts(m, "vendor_id\t: GenuineIntel\n");
++	seq_puts(m, "cpu family\t: 6\n");
++	seq_puts(m, "model\t\t: 6\n");
++	seq_puts(m, "model name\t: kwemu x86-64\n");
++	seq_puts(m, "stepping\t: 3\n");
++	seq_puts(m, "cpu MHz\t\t: 1000.000\n");
++	seq_puts(m, "fpu\t\t: yes\n");
++	seq_puts(m, "fpu_exception\t: yes\n");
++	seq_puts(m, "wp\t\t: yes\n");
++	seq_puts(m, "flags\t\t: fpu tsc msr pae cx8 sep pge cmov clflush mmx fxsr sse sse2\n");
++	seq_puts(m, "bugs\t\t:\n");
++	seq_printf(m, "bogomips\t: %lu.%02lu\n",
++		   loops_per_jiffy / (500000UL / HZ),
++		   loops_per_jiffy / (5000UL / HZ) % 100);
++	seq_puts(m, "clflush size\t: 64\n");
++	seq_puts(m, "cache_alignment\t: 64\n");
++	seq_puts(m, "address sizes\t: 48 bits physical, 48 bits virtual\n");
++	seq_puts(m, "power management:\n\n");
++#else
+ 	/* arm64's format (arch/arm64/kernel/cpuinfo.c), for kwemu's MIDR_EL1. */
+ 	seq_printf(m, "processor\t: %lu\n", cpu_id);
+ 	seq_printf(m, "BogoMIPS\t: %lu.%02lu\n",
+@@ -182,6 +216,7 @@ static int c_show(struct seq_file *m, void *v)
+ 	seq_printf(m, "CPU variant\t: 0x%x\n", (KW_MIDR >> 20) & 0xf);
+ 	seq_printf(m, "CPU part\t: 0x%03x\n", (KW_MIDR >> 4) & 0xfff);
+ 	seq_printf(m, "CPU revision\t: %d\n\n", KW_MIDR & 0xf);
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
+index 98b3ef59d..8785e350d 100644
+--- a/arch/wasm/kernel/process.c
++++ b/arch/wasm/kernel/process.c
+@@ -426,12 +426,21 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 		p->thread.fn_arg = args->fn_arg;
+ 	} else {
+ 		*childregs = *current_pt_regs();
++#ifdef CONFIG_WASM_USER_X86_64
++		childregs->user.rax = 0; /* child returns 0 */
++		if (args->stack)
++			childregs->user.rsp = args->stack;
++		/* Otherwise the child keeps the parent's FS base, as on x86-64. */
++		if (args->flags & CLONE_SETTLS)
++			childregs->user.fs_base = args->tls;
++#else
+ 		childregs->user.x[0] = 0; /* child returns 0 */
+ 		if (args->stack)
+ 			childregs->user.sp = args->stack;
+ 		/* Otherwise the child keeps the parent's TPIDR_EL0, as on arm64. */
+ 		if (args->flags & CLONE_SETTLS)
+ 			childregs->user.tpidr_el0 = args->tls;
++#endif
+ 		p->thread.fn = NULL;
+ 		p->thread.fn_arg = NULL;
+ 	}
+@@ -458,14 +467,23 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ }
+ 
+ /*
+- * exec: every register zero (also TPIDR_EL0, FPCR and FPSR, as arm64's
+- * flush_thread() leaves them), PSTATE EL0t with NZCV clear.
++ * exec: every register zero (also arm64's TPIDR_EL0/FPCR/FPSR, or x86-64's
++ * FS/GS bases and MXCSR), PSTATE EL0t with NZCV clear / RFLAGS with IF.
+  */
+ void start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp)
+ {
+ 	memset(&regs->user, 0, sizeof(regs->user));
++#ifdef CONFIG_WASM_USER_X86_64
++	regs->user.rip = pc;
++	regs->user.rsp = sp;
++	regs->user.eflags = 0x202;	/* IF | reserved bit 1 */
++	regs->user.cs = 0x33;
++	regs->user.ss = 0x2b;
++	regs->user.mxcsr = 0x1f80;
++#else
+ 	regs->user.pc = pc;
+ 	regs->user.sp = sp;
++#endif
+ 	regs->kernel = 0;
+ }
+ 
+@@ -474,6 +492,18 @@ void show_regs(struct pt_regs *regs)
+ 	int i;
+ 
+ 	show_regs_print_info(KERN_DEFAULT);
++#ifdef CONFIG_WASM_USER_X86_64
++	pr_cont("rip: %016llx rsp: %016llx rflags: %08llx\n",
++		regs->user.rip, regs->user.rsp, regs->user.eflags);
++	pr_cont("rax: %016llx rbx: %016llx rcx: %016llx rdx: %016llx\n",
++		regs->user.rax, regs->user.rbx, regs->user.rcx, regs->user.rdx);
++	pr_cont("rsi: %016llx rdi: %016llx rbp: %016llx\n",
++		regs->user.rsi, regs->user.rdi, regs->user.rbp);
++	for (i = 0; i < 15; i += 3)
++		pr_cont(" r%-2d %016llx r%-2d %016llx r%-2d %016llx\n",
++			i + 8, regs->user.r8, i + 9, regs->user.r9,
++			i + 10, regs->user.r10);
++#else
+ 	pr_cont("pc : %016llx lr : %016llx sp : %016llx nzcv: %08x\n",
+ 		regs->user.pc, regs->user.x[30], regs->user.sp,
+ 		regs->user.nzcv);
+@@ -481,6 +511,7 @@ void show_regs(struct pt_regs *regs)
+ 		pr_cont(" x%-2d %016llx x%-2d %016llx x%-2d %016llx\n",
+ 			i, regs->user.x[i], i + 1, regs->user.x[i + 1],
+ 			i + 2, regs->user.x[i + 2]);
++#endif
+ }
+ 
+ void show_stack(struct task_struct *task, unsigned long *stack,
+diff --git a/arch/wasm/kernel/prof.c b/arch/wasm/kernel/prof.c
+index 6a2e90487..a59973199 100644
+--- a/arch/wasm/kernel/prof.c
++++ b/arch/wasm/kernel/prof.c
+@@ -264,7 +264,7 @@ bool kw_prof_leave(struct kw_cpu *cpu, struct pt_regs *regs, unsigned int ev, u6
+ 		return false;
+ 	}
+ 	p->left = 0;
+-	kw_prof_record(KW_PROF_INSN, regs->user.pc, 0, 0, true);
++	kw_prof_record(KW_PROF_INSN, instruction_pointer(regs), 0, 0, true);
+ 	if (ev != KW_EV_BUDGET || !rest)
+ 		return false;
+ 	/* User code goes on at once: a time sample after this counts it. */
+@@ -288,7 +288,7 @@ void kw_prof_tick(struct pt_regs *regs)
+ 		return;
+ 	if (user_mode(regs) && p->retired) {
+ 		p->tick = true;
+-		p->tick_pc = regs->user.pc;
++		p->tick_pc = instruction_pointer(regs);
+ 		p->tick_tier = kw_debug_last_stop(wasm_kw_cpu, &p->tick_block);
+ 		return;
+ 	} else if (is_idle_task(t)) {
+@@ -296,9 +296,9 @@ void kw_prof_tick(struct pt_regs *regs)
+ 	} else {
+ 		kind = KW_PROF_KERNEL;
+ 		if (user_mode(regs))
+-			pc = regs->user.pc;
++			pc = instruction_pointer(regs);
+ 		else if (!(t->flags & PF_KTHREAD))
+-			pc = task_pt_regs(t)->user.pc;
++			pc = instruction_pointer(task_pt_regs(t));
+ 	}
+ 	kw_prof_record(kind, pc, 0, 0, false);
+ }
+diff --git a/arch/wasm/kernel/ptrace.c b/arch/wasm/kernel/ptrace.c
+index 96f8810cf..f8adc5e09 100644
+--- a/arch/wasm/kernel/ptrace.c
++++ b/arch/wasm/kernel/ptrace.c
+@@ -18,6 +18,8 @@
+ #include <linux/sched/task_stack.h>
+ #include <asm/syscall.h>
+ 
++#ifdef CONFIG_WASM_USER_AARCH64
++
+ #define PSR_NZCV	(PSR_N_BIT | PSR_Z_BIT | PSR_C_BIT | PSR_V_BIT)
+ 
+ static int gpr_get(struct task_struct *target,
+@@ -261,3 +263,32 @@ long arch_ptrace(struct task_struct *child, long request, unsigned long addr,
+ {
+ 	return ptrace_request(child, request, addr, data);
+ }
++
++#else /* CONFIG_WASM_USER_X86_64 */
++
++/*
++ * No x86-64 regsets yet (HAVE_ARCH_TRACEHOOK is off): ptrace can stop,
++ * continue and single-step via the generic paths, but GETREGSET/SETREGSET
++ * and the core-dump notes have no x86 layout until the next step.
++ */
++const struct user_regset_view *task_user_regset_view(struct task_struct *task)
++{
++	return NULL;
++}
++
++void user_disable_single_step(struct task_struct *task)
++{
++}
++
++void ptrace_disable(struct task_struct *child)
++{
++	user_disable_single_step(child);
++}
++
++long arch_ptrace(struct task_struct *child, long request, unsigned long addr,
++		 unsigned long data)
++{
++	return ptrace_request(child, request, addr, data);
++}
++
++#endif
+diff --git a/arch/wasm/kernel/signal.c b/arch/wasm/kernel/signal.c
+index 040dd1c65..161830c06 100644
+--- a/arch/wasm/kernel/signal.c
++++ b/arch/wasm/kernel/signal.c
+@@ -29,6 +29,8 @@
+ #include <asm/kw_emu.h>
+ #include <asm/kwcpu.h>
+ 
++#ifdef CONFIG_WASM_USER_AARCH64
++
+ struct rt_sigframe {
+ 	struct siginfo info;
+ 	struct ucontext uc;
+@@ -322,3 +324,303 @@ static int __init init_signal_minsigstksz(void)
+ 	return 0;
+ }
+ arch_initcall(init_signal_minsigstksz);
++
++#else /* CONFIG_WASM_USER_X86_64 */
++
++/*
++ * x86-64's rt_sigframe (arch/x86/kernel/signal_64.c, arch/x86/include/
++ * uapi/asm/sigcontext.h), without x32 and without a vDSO. The kernel's
++ * sigset_t is 8 bytes; a libc's ucontext_t has a wider sigmask, which the
++ * kernel does not touch.
++ *
++ * The frame: pretcode (the SA_RESTORER stub, required on x86-64), ucontext
++ * (with the 23 GPR words and a pointer to the FXSAVE area), then siginfo;
++ * the FXSAVE area follows the frame. The handler is entered directly with
++ * rdi = sig, rsi = &info, rdx = &ucontext and rsp = frame, so its ret goes
++ * to pretcode. There is no vDSO and no sigpage: x86-64 requires
++ * SA_RESTORER, which musl and glibc always set.
++ */
++
++#define UC_SIGCONTEXT_SS	0x2
++#define X86_EFLAGS_IF		0x200U
++#define X86_EFLAGS_TF		0x100U
++
++struct sigcontext_x86 {
++	__u64 r8, r9, r10, r11, r12, r13, r14, r15;
++	__u64 rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags;
++	__u16 cs, gs, fs;
++	union { __u16 ss; __u16 pad0; };
++	__u64 err, trapno, oldmask, cr2;
++	__u64 fpstate;
++	__u64 reserved1[8];
++};
++
++struct ucontext_x86 {
++	unsigned long uc_flags;
++	struct ucontext_x86 __user *uc_link;
++	stack_t uc_stack;
++	struct sigcontext_x86 uc_mcontext;
++	sigset_t uc_sigmask;
++};
++
++struct fpstate_x86 {
++	__u16 cwd, swd, twd, fop;
++	__u64 rip, rdp;
++	__u32 mxcsr, mxcsr_mask;
++	__u8 st[128];
++	__u8 xmm[256];
++	__u8 reserved[96];
++};
++
++struct rt_sigframe_x86 {
++	char __user *pretcode;
++	struct ucontext_x86 uc;
++	struct siginfo info;
++	/* struct fpstate_x86 follows here, 16-byte aligned */
++};
++
++unsigned long signal_minsigstksz __ro_after_init;
++
++static struct fpstate_x86 __user *sigframe_fp(struct rt_sigframe_x86 __user *frame)
++{
++	return (struct fpstate_x86 __user *)
++		((unsigned long)(frame + 1) + 15 & ~15UL);
++}
++
++SYSCALL_DEFINE0(rt_sigreturn)
++{
++	struct pt_regs *regs = current_pt_regs();
++	struct rt_sigframe_x86 __user *frame;
++	struct sigcontext_x86 __user *sc;
++	struct fpstate_x86 __user *fp;
++	sigset_t set;
++	__u64 g[18], fs_base, gs_base;
++	int i, err = 0;
++
++	current->restart_block.fn = do_no_restart_syscall;
++
++	if (regs->user.rsp & 7)
++		goto badframe;
++
++	frame = (struct rt_sigframe_x86 __user *)regs->user.rsp;
++	if (!access_ok(frame, sizeof(*frame)))
++		goto badframe;
++	sc = &frame->uc.uc_mcontext;
++
++	if (__copy_from_user(&set, &frame->uc.uc_sigmask, sizeof(set)))
++		goto badframe;
++	set_current_blocked(&set);
++
++	/* sigcontext order: r8..r15, rdi, rsi, rbp, rbx, rdx, rax, rcx,
++	 * rsp, rip, eflags (kw_regs stores the GPRs in another order). */
++	err |= __copy_from_user(g, &sc->r8, sizeof(g));
++	err |= __get_user(fs_base, &sc->reserved1[0]);
++	err |= __get_user(gs_base, &sc->reserved1[1]);
++	if (err)
++		goto badframe;
++	regs->user.r8 = g[0];
++	regs->user.r9 = g[1];
++	regs->user.r10 = g[2];
++	regs->user.r11 = g[3];
++	regs->user.r12 = g[4];
++	regs->user.r13 = g[5];
++	regs->user.r14 = g[6];
++	regs->user.r15 = g[7];
++	regs->user.rdi = g[8];
++	regs->user.rsi = g[9];
++	regs->user.rbp = g[10];
++	regs->user.rbx = g[11];
++	regs->user.rdx = g[12];
++	regs->user.rax = g[13];
++	regs->user.rcx = g[14];
++	regs->user.rsp = g[15];
++	regs->user.rip = g[16];
++	regs->user.eflags = g[17];
++	if (regs->user.eflags & X86_EFLAGS_TF)
++		goto badframe;
++
++	regs->user.cs = 0x33;
++	regs->user.ss = 0x2b;
++	regs->user.fs_base = fs_base;
++	regs->user.gs_base = gs_base;
++	/* The saved fs/gs selectors are always the flat user ones here. */
++
++	fp = sigframe_fp(frame);
++	if (__copy_from_user(&regs->user.mxcsr, &fp->mxcsr, sizeof(u32)))
++		goto badframe;
++	for (i = 0; i < 16; i++)
++		err |= __copy_from_user(&regs->user.xmm[i], &fp->xmm[i * 16], 16);
++	if (err || restore_altstack(&frame->uc.uc_stack))
++		goto badframe;
++
++	regs->cause = PT_CAUSE_NONE;
++	return regs->user.rax;
++
++badframe:
++	if (show_unhandled_signals)
++		pr_info_ratelimited("%s[%d]: bad frame in %s: frame=%p rip=%llx rsp=%llx\n",
++				    current->comm, task_pid_nr(current), __func__,
++				    frame, instruction_pointer(regs),
++				    user_stack_pointer(regs));
++	force_sig(SIGSEGV);
++	return 0;
++}
++
++static int setup_sigframe(struct rt_sigframe_x86 __user *frame,
++			  struct pt_regs *regs, sigset_t *set)
++{
++	struct sigcontext_x86 __user *sc = &frame->uc.uc_mcontext;
++	struct fpstate_x86 __user *fp = sigframe_fp(frame);
++	int i, err = 0;
++
++	err |= __put_user(regs->user.r8, &sc->r8);
++	err |= __put_user(regs->user.r9, &sc->r9);
++	err |= __put_user(regs->user.r10, &sc->r10);
++	err |= __put_user(regs->user.r11, &sc->r11);
++	err |= __put_user(regs->user.r12, &sc->r12);
++	err |= __put_user(regs->user.r13, &sc->r13);
++	err |= __put_user(regs->user.r14, &sc->r14);
++	err |= __put_user(regs->user.r15, &sc->r15);
++	err |= __put_user(regs->user.rdi, &sc->rdi);
++	err |= __put_user(regs->user.rsi, &sc->rsi);
++	err |= __put_user(regs->user.rbp, &sc->rbp);
++	err |= __put_user(regs->user.rbx, &sc->rbx);
++	err |= __put_user(regs->user.rdx, &sc->rdx);
++	err |= __put_user(regs->user.rax, &sc->rax);
++	err |= __put_user(regs->user.rcx, &sc->rcx);
++	err |= __put_user(regs->user.rsp, &sc->rsp);
++	err |= __put_user(regs->user.rip, &sc->rip);
++	err |= __put_user(regs->user.eflags, &sc->eflags);
++	err |= __put_user((__u16)0x33, &sc->cs);
++	err |= __put_user((__u16)0x2b, &sc->ss);
++	err |= __put_user((__u64)0, &sc->err);
++	err |= __put_user((__u64)14, &sc->trapno);	/* page fault */
++	err |= __put_user((__u64)regs->badaddr, &sc->cr2);
++	err |= __put_user((__u64)fp, &sc->fpstate);
++	/* Kernel-private: the FS/GS bases, which sigcontext does not carry. */
++	err |= __put_user(regs->user.fs_base, &sc->reserved1[0]);
++	err |= __put_user(regs->user.gs_base, &sc->reserved1[1]);
++	err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));
++
++	err |= __put_user((__u16)0x37f, &fp->cwd);
++	err |= __put_user((__u32)regs->user.mxcsr, &fp->mxcsr);
++	for (i = 0; i < 16; i++)
++		err |= __copy_to_user(&fp->xmm[i * 16], &regs->user.xmm[i], 16);
++
++	return err ? -EFAULT : 0;
++}
++
++static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
++			  struct pt_regs *regs)
++{
++	struct rt_sigframe_x86 __user *frame;
++	void __user *fp;
++	unsigned long sp;
++	int err = 0;
++
++	/* x86-64 should always use SA_RESTORER. */
++	if (!(ksig->ka.sa.sa_flags & SA_RESTORER))
++		return -EFAULT;
++
++	/* get_sigframe(): the frame and its FXSAVE area, 16-byte aligned. */
++	sp = sigsp(regs->user.rsp, ksig);
++	sp = (sp - sizeof(struct rt_sigframe_x86) - sizeof(struct fpstate_x86)) & ~15UL;
++	frame = (struct rt_sigframe_x86 __user *)sp;
++	fp = sigframe_fp(frame);
++
++	if (!access_ok(frame, sizeof(struct rt_sigframe_x86) +
++		       sizeof(struct fpstate_x86) + 15))
++		return -EFAULT;
++
++	err |= __put_user(0UL, &frame->uc.uc_flags);
++	err |= __put_user((void __user *)0, &frame->uc.uc_link);
++	err |= __save_altstack(&frame->uc.uc_stack, regs->user.rsp);
++	err |= __put_user((char __user *)ksig->ka.sa.sa_restorer, &frame->pretcode);
++	err |= __put_user((__u64)fp, &frame->uc.uc_mcontext.fpstate);
++	err |= setup_sigframe(frame, regs, set);
++	if (ksig->ka.sa.sa_flags & SA_SIGINFO)
++		err |= copy_siginfo_to_user(&frame->info, &ksig->info);
++	if (err)
++		return -EFAULT;
++
++	regs->user.rdi = ksig->sig;
++	regs->user.rax = 0;
++	regs->user.rsi = (unsigned long)&frame->info;
++	regs->user.rdx = (unsigned long)&frame->uc;
++	regs->user.rip = (unsigned long)ksig->ka.sa.sa_handler;
++	regs->user.rsp = (unsigned long)frame;
++	regs->user.cs = 0x33;
++	regs->user.ss = 0x2b;
++	regs->user.eflags |= X86_EFLAGS_IF;
++	regs->user.eflags &= ~X86_EFLAGS_TF;
++
++	return 0;
++}
++
++static void handle_signal(struct ksignal *ksig, struct pt_regs *regs)
++{
++	sigset_t *oldset = sigmask_to_save();
++	int ret;
++
++	rseq_signal_deliver(ksig, regs);
++	ret = setup_rt_frame(ksig, oldset, regs);
++	signal_setup_done(ret, ksig, test_thread_flag(TIF_SINGLESTEP));
++}
++
++void arch_do_signal_or_restart(struct pt_regs *regs)
++{
++	unsigned long continue_addr = 0, restart_addr = 0;
++	int retval = 0;
++	struct ksignal ksig;
++	bool syscall = (regs->cause == PT_CAUSE_SYSCALL);
++
++	if (syscall) {
++		continue_addr = regs->user.rip;
++		restart_addr = continue_addr - 2;	/* SYSCALL */
++		retval = regs->user.rax;
++
++		regs->cause = PT_CAUSE_NONE;
++
++		switch (retval) {
++		case -ERESTARTNOHAND:
++		case -ERESTARTSYS:
++		case -ERESTARTNOINTR:
++		case -ERESTART_RESTARTBLOCK:
++			regs->user.rax = regs->orig_x0;
++			regs->user.rip = restart_addr;
++			break;
++		}
++	}
++
++	if (get_signal(&ksig)) {
++		if (regs->user.rip == restart_addr &&
++		    (retval == -ERESTARTNOHAND ||
++		     retval == -ERESTART_RESTARTBLOCK ||
++		     (retval == -ERESTARTSYS &&
++		      !(ksig.ka.sa.sa_flags & SA_RESTART)))) {
++			regs->user.rax = -EINTR;
++			regs->user.rip = continue_addr;
++		}
++
++		handle_signal(&ksig, regs);
++		return;
++	}
++
++	if (syscall && regs->user.rip == restart_addr &&
++	    retval == -ERESTART_RESTARTBLOCK) {
++		regs->user.rax = __NR_restart_syscall;
++		regs->user.rip = restart_addr;
++	}
++
++	restore_saved_sigmask();
++}
++
++static int __init init_signal_minsigstksz(void)
++{
++	signal_minsigstksz = sizeof(struct rt_sigframe_x86) +
++		sizeof(struct fpstate_x86) + 16;
++	return 0;
++}
++arch_initcall(init_signal_minsigstksz);
++
++#endif /* CONFIG_WASM_USER_X86_64 */
+diff --git a/arch/wasm/kernel/sys.c b/arch/wasm/kernel/sys.c
+index f72cbd384..abb7912df 100644
+--- a/arch/wasm/kernel/sys.c
++++ b/arch/wasm/kernel/sys.c
+@@ -7,6 +7,9 @@
+ #include <linux/mm.h>
+ #include <linux/personality.h>
+ #include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <asm/ptrace.h>
++#include <uapi/asm/prctl.h>
+ 
+ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+ 		unsigned long, prot, unsigned long, flags,
+@@ -18,6 +21,7 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+ }
+ 
++#ifdef CONFIG_WASM_USER_AARCH64
+ /* There is no AArch32 at EL0 (syscall_table.c maps personality here). */
+ SYSCALL_DEFINE1(arm64_personality, unsigned int, personality)
+ {
+@@ -25,3 +29,55 @@ SYSCALL_DEFINE1(arm64_personality, unsigned int, personality)
+ 		return -EINVAL;
+ 	return ksys_personality(personality);
+ }
++#else
++/*
++ * x86-64's per-thread segment bases. There is no hardware to program: the
++ * bases live in the user context kwemu runs, so the syscall changes them
++ * directly.
++ */
++SYSCALL_DEFINE2(arch_prctl, int, code, unsigned long, addr)
++{
++	struct pt_regs *regs = current_pt_regs();
++
++	switch (code) {
++	case ARCH_SET_FS:
++		regs->user.fs_base = addr;
++		return 0;
++	case ARCH_SET_GS:
++		regs->user.gs_base = addr;
++		return 0;
++	case ARCH_GET_FS:
++		return put_user(regs->user.fs_base,
++				(unsigned long __user *)addr) ? -EFAULT : 0;
++	case ARCH_GET_GS:
++		return put_user(regs->user.gs_base,
++				(unsigned long __user *)addr) ? -EFAULT : 0;
++	case ARCH_GET_CPUID:
++		return 0;
++	case ARCH_SET_CPUID:
++		return -ENODEV;
++	default:
++		return -EINVAL;
++	}
++}
++
++/*
++ * The selector and port instructions are privileged on x86-64; user mode
++ * here has no LDT and no I/O bitmap, so they exist only to return the same
++ * errors a real kernel would.
++ */
++SYSCALL_DEFINE3(modify_ldt, int, func, void __user *, ptr, unsigned long, bytecount)
++{
++	return -ENOSYS;
++}
++
++SYSCALL_DEFINE1(iopl, unsigned int, level)
++{
++	return -EPERM;
++}
++
++SYSCALL_DEFINE3(ioperm, unsigned long, from, unsigned long, num, int, turn_on)
++{
++	return -EPERM;
++}
++#endif
+diff --git a/arch/wasm/kernel/syscall_table.c b/arch/wasm/kernel/syscall_table.c
+index ae0e91d32..f09050aef 100644
+--- a/arch/wasm/kernel/syscall_table.c
++++ b/arch/wasm/kernel/syscall_table.c
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* arm64 syscall table (generated from scripts/syscall.tbl, abis as arm64). */
++/*
++ * The guest syscall table: arm64's (generated from scripts/syscall.tbl) by
++ * default, or arch/x86/entry/syscalls/syscall_64.tbl with
++ * CONFIG_WASM_USER_X86_64 (Makefile.syscalls).
++ */
+ 
+ #include <linux/linkage.h>
+ #include <linux/syscalls.h>
+@@ -7,9 +11,12 @@
+ #include <asm/syscall.h>
+ 
+ #define __SYSCALL_WITH_COMPAT(nr, native, compat) __SYSCALL(nr, native)
++#define __SYSCALL_NORETURN(nr, call) __SYSCALL(nr, call)
+ 
++#ifdef CONFIG_WASM_USER_AARCH64
+ /* arm64 rejects PER_LINUX32 (no AArch32 at EL0): sys.c. */
+ #define __wasm_sys_personality __wasm_sys_arm64_personality
++#endif
+ 
+ #undef __SYSCALL
+ #define __SYSCALL(nr, call)	asmlinkage long __wasm_##call(const struct pt_regs *);
+diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
+index 525dacb6d..0e8a616f0 100644
+--- a/arch/wasm/kernel/traps.c
++++ b/arch/wasm/kernel/traps.c
+@@ -55,6 +55,33 @@ asmlinkage long __wasm_sys_ni_syscall(const struct pt_regs *__unused)
+ 
+ static void do_syscall(struct pt_regs *regs)
+ {
++#ifdef CONFIG_WASM_USER_X86_64
++	/* The low 32 bits, as x86-64 takes an int from rax. */
++	long nr = (int)regs->user.rax;
++
++	regs->orig_x0 = regs->user.rdi;
++	regs->syscallno = nr;
++	regs->cause = PT_CAUSE_SYSCALL;
++
++	/*
++	 * rax keeps the number for a tracer's entry stop, and only a user's
++	 * syscall(-1) presets -ENOSYS, since a tracer skips a syscall by
++	 * setting its number to -1 and rax to the result.
++	 */
++	if (nr == NO_SYSCALL)
++		regs->user.rax = -ENOSYS;
++
++	/* False: skip the call and keep rax (a tracer or seccomp may have set it). */
++	if (syscall_enter_from_user_mode_randomize_stack(regs, &nr) &&
++	    nr != NO_SYSCALL) {
++		if (nr >= 0 && nr < NR_syscalls) {
++			nr = array_index_nospec(nr, NR_syscalls);
++			regs->user.rax = ((syscall_t)sys_call_table[nr])(regs);
++		} else {
++			regs->user.rax = -ENOSYS;
++		}
++	}
++#else
+ 	/* The low 32 bits, as arm64's el0_svc_common() takes an int. */
+ 	long nr = (int)regs->user.x[8];
+ 
+@@ -81,7 +108,7 @@ static void do_syscall(struct pt_regs *regs)
+ 			regs->user.x[0] = -ENOSYS;
+ 		}
+ 	}
+-
++#endif
+ 	syscall_exit_to_user_mode(regs);
+ }
+ 
+@@ -93,7 +120,7 @@ static void do_user_trap(struct pt_regs *regs, int signo, int code,
+ 	if (show_unhandled_signals && unhandled_signal(current, signo))
+ 		pr_info_ratelimited("%s[%d]: unhandled trap sig=%d pc=%llx addr=%lx insn=%llx\n",
+ 				    current->comm, task_pid_nr(current), signo,
+-				    regs->user.pc, addr,
++				    instruction_pointer(regs), addr,
+ 				    (unsigned long long)wasm_kw_cpu->ev.insn);
+ 	force_sig_fault(signo, code, (void __user *)addr);
+ 	local_irq_disable();
+@@ -220,7 +247,7 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 
+ 			cpu->budget += step_rest;
+ 			if (retired && (ev == KW_EV_BUDGET || ev == KW_EV_INTERRUPT)) {
+-				do_user_trap(regs, SIGTRAP, TRAP_TRACE, regs->user.pc);
++				do_user_trap(regs, SIGTRAP, TRAP_TRACE, instruction_pointer(regs));
+ 				continue;
+ 			}
+ 		}
+@@ -237,13 +264,18 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 			do_user_fault(regs, cpu->ev.addr, cpu->ev.access);
+ 			break;
+ 		case KW_EV_ILLEGAL:
+-			do_user_trap(regs, SIGILL, ILL_ILLOPC, regs->user.pc);
++			do_user_trap(regs, SIGILL, ILL_ILLOPC, instruction_pointer(regs));
+ 			break;
+ 		case KW_EV_BREAKPOINT:
+-			do_user_trap(regs, SIGTRAP, TRAP_BRKPT, regs->user.pc);
++			do_user_trap(regs, SIGTRAP, TRAP_BRKPT, instruction_pointer(regs));
+ 			break;
+ 		case KW_EV_MISALIGNED:
++			#ifdef CONFIG_WASM_USER_X86_64
++			/* x86-64: an aligned SSE access faults as SIGSEGV. */
++			do_user_trap(regs, SIGSEGV, SEGV_ACCERR, cpu->ev.addr);
++#else
+ 			do_user_trap(regs, SIGBUS, BUS_ADRALN, cpu->ev.addr);
++#endif
+ 			break;
+ 		case KW_EV_BUDGET:
+ 		case KW_EV_INTERRUPT:
+@@ -251,7 +283,7 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 			cpu->budget = KW_SLICE;
+ 			break;
+ 		default:
+-			do_user_trap(regs, SIGILL, ILL_ILLTRP, regs->user.pc);
++			do_user_trap(regs, SIGILL, ILL_ILLTRP, instruction_pointer(regs));
+ 			break;
+ 		}
+ 	}
+diff --git a/arch/wasm/mm/fault.c b/arch/wasm/mm/fault.c
+index 50f9d5498..7fad58fc3 100644
+--- a/arch/wasm/mm/fault.c
++++ b/arch/wasm/mm/fault.c
+@@ -196,10 +196,10 @@ void do_user_page_fault(struct pt_regs *regs, unsigned long addr,
+ 		force_sig_fault(SIGBUS, BUS_ADRERR, (void __user *)addr);
+ 	else {
+ 		if (show_unhandled_signals && unhandled_signal(current, SIGSEGV))
+-			pr_info_ratelimited("%s[%d]: segfault at %lx pc %llx sp %llx lr %llx (%s)\n",
++			pr_info_ratelimited("%s[%d]: segfault at %lx pc %llx sp %llx (%s)\n",
+ 					    current->comm, task_pid_nr(current),
+-					    addr, regs->user.pc, regs->user.sp,
+-					    regs->user.x[30],
++					    addr, instruction_pointer(regs),
++					    user_stack_pointer(regs),
+ 					    access == KW_ACCESS_WRITE ? "write" :
+ 					    access == KW_ACCESS_EXEC ? "exec" : "read");
+ 		force_sig_fault(SIGSEGV, code, (void __user *)addr);
+diff --git a/arch/wasm/mm/sigpage.c b/arch/wasm/mm/sigpage.c
+index 09c4dc249..5d63c2c7c 100644
+--- a/arch/wasm/mm/sigpage.c
++++ b/arch/wasm/mm/sigpage.c
+@@ -31,10 +31,16 @@ static int __init sigpage_init(void)
+ 	insn[1] = 0xd4000001;	/* svc #0 */
+ 	return 0;
+ }
++#ifdef CONFIG_WASM_USER_AARCH64
+ arch_initcall(sigpage_init);
++#endif
+ 
+ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ {
++#ifdef CONFIG_WASM_USER_X86_64
++	/* x86-64 signal delivery requires SA_RESTORER (signal.c). */
++	return 0;
++#else
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma;
+ 	unsigned long addr;
+@@ -60,4 +66,5 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ out:
+ 	mmap_write_unlock(mm);
+ 	return ret;
++#endif
+ }
+-- 
+2.53.0
+

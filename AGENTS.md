@@ -6,7 +6,15 @@ Linux ELF (ARMv8.0-A with FP, AdvSIMD and the crypto, CRC32 and LSE
 extensions; a64/isa.md), run by kwemu, a software CPU in Zig linked
 into the kernel: the AArch64 front end (src/a64: a reference interpreter, a
 decoded-op tier and a wasm JIT) on an ISA-neutral MMU, block cache and JIT
-core (src/emu). Its contract with the kernel is `include/kw_emu.h` (ABI 3).
+core (src/emu).
+
+The guest ISA is selected at build time (`-Dkw-user-isa=aarch64` by default;
+x86-64 is being brought up in `src/x86_64`, HANDOFF.md). `include/kw_emu.h`
+selects the matching `struct kw_regs` layout with `KW_USER_ISA_X86_64`; the
+kernel side of the x86-64 ABI is not in the kernel tree yet. The x86-64
+reference interpreter has its own native harness and tests
+(`zig build test-x86-64`, `test/x86-64-test.mjs`), and its wasm64 object
+imports nothing, like the A64 one. Its contract with the kernel is `include/kw_emu.h` (ABI 3).
 The kernel bundle (`unkernel.wasm`) carries a small base initramfs that
 boots a distro image (Alpine or Debian, read-only erofs, attached as a disk)
 under an overlay root, or the base shell without one. README.md is the overview,
@@ -20,6 +28,7 @@ programs).
 | --- | --- |
 | [.agents/kernel.md](.agents/kernel.md) | kernel tree and patch workflow, `kw_emu.h` contract, memory model, JSPI, host imports, IRQs, arm64 user ABI, the two builds and two kernels; `.agents/kernel/` holds SMP, parking and snapshots, devices, config, kernel tests, guest images |
 | [.agents/a64.md](.agents/a64.md) | the AArch64 CPU (src/a64): layout, group-file conventions, adding instructions, tests; `.agents/a64/` holds instruction semantics and the coverage tool (`isa.md`), the decoded-op tier (`tier.md`), the JIT (`jit.md`), numbers, rejected designs and levers (`performance.md`) |
+| [.agents/x86_64.md](.agents/x86_64.md) | the x86-64 CPU (src/x86_64): the reference interpreter, wasm-object rules, its harness and guests, current limits |
 | [.agents/kwemu.md](.agents/kwemu.md) | the ISA-neutral core: MMU and TLBs, block cache, JIT core (regions, invariants, SMP, compile window, host contract), softfloat, measuring, rejected designs |
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
@@ -34,7 +43,9 @@ programs).
 
 ```sh
 ./setup.sh                  # check prerequisites, then zig build + kernel/build.sh all
-zig build test              # A64 unit tests and guests against qemu-aarch64
+zig build test              # A64 tests and guests, plus the x86-64 tests and guests
+zig build test-x86-64       # only the x86-64 reference interpreter (native)
+KW_USER_ISA=x86_64 kernel/build.sh kernel   # the x86-64 kernel (vendor/build/kernel-x86_64)
 kernel/build.sh kernel      # the UP kernel, refreshes the bundle (smp: the SMP kernel)
 node js/cli.ts              # boot Alpine (vendor/build/distro) on the bundle; --help lists options
 ```

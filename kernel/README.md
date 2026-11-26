@@ -51,3 +51,12 @@ node js/cli.ts --data /tmp/kwdata.img                             # with the dat
 ```
 
 Which tests to run for a change: .agents/testing.md.
+
+## Guest ISA
+
+The default kernel runs AArch64 user space. `KW_USER_ISA=x86_64
+kernel/build.sh kernel` builds the x86-64 user ABI instead
+(`CONFIG_WASM_USER_X86_64`, `arch/wasm/configs/kw_x86.config`) into
+`vendor/build/kernel-x86_64/`; the AArch64 outputs are not touched. The
+x86-64 patch is `kernel/patches/linux/0056-wasm-run-x86-64-user-space.patch`
+and the emulator side is `src/x86_64/` (HANDOFF.md).

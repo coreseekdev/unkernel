@@ -105,6 +105,14 @@ set -euo pipefail
 . "$(dirname "$0")/tools/env.sh"   # root, vendor, build, zig, pins, real_bin, ...
 jobs="${JOBS:-$(nproc)}"
 what="${1:-all}"
+# Guest ISA of the kernel (`kernel` and `smp`): aarch64 (default) or x86_64
+# (CONFIG_WASM_USER_X86_64, arch/wasm/configs/kw_x86.config). x86-64 builds
+# into its own output roots, so the AArch64 kernels are untouched.
+user_isa="${KW_USER_ISA:-aarch64}"
+case "$user_isa" in
+	aarch64 | x86_64) ;;
+	*) echo "KW_USER_ISA must be aarch64 or x86_64" >&2; exit 2 ;;
+esac
 use_real_host_tools
 
 # Kernel base: Linux v7.3.4 from kernel.org, fetched by exact commit (shallow).
@@ -120,11 +128,19 @@ BINARYEN_SHA256_x86_64=2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af479778
 BINARYEN_SHA256_aarch64=89c07ea56faf38d0fbecf36ca8ec0721756716185f265b568e133d427f299bf8
 
 ksrc="${KSRC:-$vendor/src/linux-wasm-kernel}"
-kout="${KOUT:-$build/kernel}"
+if [ "$user_isa" = aarch64 ]; then
+	kout="${KOUT:-$build/kernel}"
+else
+	kout="${KOUT:-$build/kernel-$user_isa}"
+fi
 # The base initramfs and its bundle (guest/lib/env.sh), the distro images.
 base_out="$(realpath -m "${KW_BASE_OUT:-$build/initramfs}")"
 distro_out="$(realpath -m "${KW_DISTRO_OUT:-$build/distro}")"
-kout_smp="${KOUT_SMP:-$build/kernel-smp}"
+if [ "$user_isa" = aarch64 ]; then
+	kout_smp="${KOUT_SMP:-$build/kernel-smp}"
+else
+	kout_smp="${KOUT_SMP:-$build/kernel-$user_isa-smp}"
+fi
 toolchain="$vendor/toolchain/bin"
 
 need_clang() {
@@ -227,6 +243,10 @@ kwemu_jit_flag() {
 # its own prefix, as a stats library is, so zig-out keeps the normal one.
 kwemu_obj() {
 	local prefix="$root/zig-out" flags=() k="${KWEMU:-}"
+	if [ "$user_isa" != aarch64 ]; then
+		prefix="$build/kwemu-$user_isa"
+		flags+=(-Dkw-user-isa="$user_isa")
+	fi
 	if [ "$1" = smp ]; then
 		prefix="$build/kwemu-smp"
 		flags=(-Dkwemu-atomics=true)
@@ -333,6 +353,7 @@ build_kernel() {
 		out="$kout_smp"
 		frags+=(kw_smp.config)
 	fi
+	[ "$user_isa" = x86_64 ] && frags+=(kw_x86.config)
 	[ -x "$toolchain/wasm-ld" ] || build_toolchain
 	prepare_kernel_tree
 	kernel_stamps

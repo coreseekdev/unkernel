@@ -15,12 +15,12 @@ machinery that is unchanged.
 
 | Path | What |
 | --- | --- |
-| `src/libkwemu.zig` | library root: exports the A64 C ABI (`src/a64/run.zig`) |
+| `src/libkwemu.zig` | library root: exports the A64 C ABI (`src/a64/run.zig`); `src/libkwemu_x86_64.zig` the x86-64 one (`src/x86_64/run.zig`) |
 | `src/emu/kwemu.zig` | `Cpu` (struct kw_cpu), page walker and TLBs, the block cache (lookup, validation, code tracking, op arena; generic over the ISA's block hooks), `kw_debug_cpu_of_jit_buf` |
 | `src/emu/jitcore.zig` | the JIT core: slot pool, host imports, compile policy, `install` and its emit retries, module skeleton, regions, the compile window, `Emit` helpers, statistics (`Jx`) |
 | `src/cpu/core.zig` | `Hart` (traps, exclusive monitor), `Kind`, `Access`, `Error`, `Exit`, `smp`; AES tables (`aes`), carry-less multiply (`bitmanip`) |
 | `src/cpu/fpu.zig` | exact softfloat for all rounding modes and flags, host-float fast paths for RNE |
-| `src/emu/harness*.zig` | test "kernel" using only the C ABI (native and wasm64; A64 ELFs) |
+| `src/emu/harness*.zig` | test "kernel" using only the C ABI (native and wasm64; A64 ELFs); `src/x86_64/harness*.zig` does the same for x86-64 ELFs |
 | `test/kwemu-unit-wasm.mjs` | runs a wasm64 unit-test module against an eager JIT host |
 | `test/kwemu-jit-host.mjs` | JS host of the JIT imports, for tests and benchmarks |
 | `test/kwemu-bench.mjs` | benchmark table (a64/performance.md) |
