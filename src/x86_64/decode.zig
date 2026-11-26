@@ -320,6 +320,7 @@ pub const Fpu = enum(u8) {
     fsubrp,
     fdivp,
     fdivrp,
+    fcmov,
     fcom,
     fcomp,
     fcompp,
@@ -1436,7 +1437,17 @@ fn fpuOp(d: *Dec, op: u8) common.DecodeError!void {
                 };
                 ins.opsz = 4;
                 ins.aux = 4; // m32int
-            } else return common.invalid(d.s, d.raw);
+            } else {
+                ins.aux = 0;
+                ins.fpu = .fcmov;
+                ins.cc = switch (ins.opx) {
+                    0 => 2, // fcmovb, CF
+                    1 => 4, // fcmove, ZF
+                    2 => 6, // fcmovbe, CF|ZF
+                    3 => 8, // fcmovu, PF
+                    else => return common.invalid(d.s, d.raw),
+                };
+            }
         },
         0xdb => {
             if (m) {
@@ -1452,11 +1463,22 @@ fn fpuOp(d: *Dec, op: u8) common.DecodeError!void {
                 ins.aux = if (ins.opx == 5 or ins.opx == 7) 7 else 5; // m80fp / m32int
             } else {
                 ins.aux = 0;
-                ins.fpu = switch (ins.opx) {
-                    5 => .fucomi,
-                    6 => .fcomi,
-                    else => return common.invalid(d.s, d.raw),
-                };
+                if (ins.opx < 4) {
+                    ins.fpu = .fcmov;
+                    ins.cc = switch (ins.opx) {
+                        0 => 3, // fcmovnb, !CF
+                        1 => 5, // fcmovne, !ZF
+                        2 => 7, // fcmovnbe, !CF && !ZF
+                        3 => 9, // fcmovnu, !PF
+                        else => unreachable,
+                    };
+                } else {
+                    ins.fpu = switch (ins.opx) {
+                        5 => .fucomi,
+                        6 => .fcomi,
+                        else => return common.invalid(d.s, d.raw),
+                    };
+                }
             }
         },
         0xdc => {

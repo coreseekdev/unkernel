@@ -267,7 +267,10 @@ pub fn flagsIncDec(r: *Regs, sz: u8, a0: u64, dec: bool) void {
     const a = a0 & m;
     const res: u64 = if (dec) (a -% 1) & m else (a +% 1) & m;
     const cf = r.eflags & state.CF;
-    const of = if (dec) ((a ^ res) & (a ^ signbit(sz)) & signbit(sz)) != 0 else ((a ^ res) & signbit(sz)) != 0;
+    // DEC overflows only from the minimum signed value, INC only into the
+    // sign bit (0x7f.. -> 0x80..): not the a ^ res form, which flags DEC 0
+    // and misses DEC 0x80.. (glibc's memcmp tail tests `dec; jle`).
+    const of = if (dec) a == signbit(sz) else res == signbit(sz);
     const af = ((a ^ 1 ^ res) & 0x10) != 0;
     r.eflags = (r.eflags & ~(state.OF | state.AF | state.SF | state.ZF | state.PF)) | cf |
         (if (of) state.OF else 0) |

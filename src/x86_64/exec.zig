@@ -376,7 +376,7 @@ fn push(s: St, ins: *const Insn) Error!Exit {
 
 fn pop(s: St, ins: *const Insn) Error!Exit {
     const sz = if (ins.opsz == 2) @as(u8, 2) else 8;
-    if (ins.cc == 0xf4 or ins.cc == 0xf5) {
+    if (ins.cc == 0xf4 or ins.cc == 0xf5) { // pop fs/gs: selectors ignored
         _ = try popValue(s, sz);
         return .next;
     }
@@ -384,9 +384,21 @@ fn pop(s: St, ins: *const Insn) Error!Exit {
     // destination unchanged: read first, write, then commit rsp.
     const sp = s.r.rsp;
     const v = try common.readMem(s, sp, sz, 0);
-    if (ins.has_modrm) {
-        try rmWrite(s, ins, sz, v);
-    } else common.regWrite(s.r, ins.rm, sz, ins.pfx.rex != 0, v);
+    if (ins.has_modrm and ins.mem) {
+        // Intel SDM: when rSP is the base of a POP's memory destination,
+        // the effective address is computed after rSP is incremented.
+        // SpiderMonkey's JIT saves the return address with `push [rsp];
+        // mov [rsp+8], 1` and restores it with `pop [rsp]` after
+        // `mov rsp, rbp; pop rbp`.
+        var ea = ins.ea;
+        if (ins.has_base and ins.base == 4) ea +%= sz;
+        if (ins.addr32) ea &= 0xffff_ffff;
+        try common.writeMem(s, ea, sz, ins.pfx.seg, v);
+    } else {
+        common.regWrite(s.r, ins.rm, sz, ins.pfx.rex != 0, v);
+        // POP rSP: the loaded value is the new stack pointer, not rSP + size.
+        if (ins.rm == 4) return .next;
+    }
     s.r.rsp = sp +% sz;
     return .next;
 }
@@ -2124,6 +2136,9 @@ fn fpuOp(s: St, ins: *const Insn) Error!Exit {
             });
             x87Pop(r);
         },
+        .fcmov => {
+            if (x87Cond(r, ins.cc)) x87Set(r, 0, x87Get(r, @intCast(ins.rm & 7)));
+        },
         .fcom, .fcomp, .fucom, .fucomp => {
             const other: f80 = if (ins.mem) try x87LoadMem(s, ins) else x87Get(r, @intCast(ins.rm & 7));
             x87Compare(r, x87Get(r, 0), other);
@@ -2284,6 +2299,20 @@ fn x87StoreMem(s: St, ins: *const Insn, v: f80) Error!void {
         },
         else => unreachable,
     }
+}
+
+fn x87Cond(r: *Regs, cc: u8) bool {
+    return switch (cc) {
+        2 => r.eflags & state.CF != 0,
+        3 => r.eflags & state.CF == 0,
+        4 => r.eflags & state.ZF != 0,
+        5 => r.eflags & state.ZF == 0,
+        6 => r.eflags & (state.CF | state.ZF) != 0,
+        7 => r.eflags & (state.CF | state.ZF) == 0,
+        8 => r.eflags & state.PF != 0,
+        9 => r.eflags & state.PF == 0,
+        else => false,
+    };
 }
 
 fn x87Round(r: *Regs, v: f80) f80 {

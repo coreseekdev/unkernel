@@ -126,6 +126,50 @@ test "x86_64: inc/dec preserve CF, neg/not" {
     try t.expect(flags(&m) & state.CF == 0);
 }
 
+test "x86_64: inc/dec overflow at the signed edges" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.code(0x1000, &([_]u8{
+        0xff, 0xc8, // dec eax
+        0xff, 0xc0, // inc eax
+        0x7e, 0x05, // jle +5 over the mov (glibc's memcmp length-0 tail: dec edx; jle)
+        0xb8, 0x11, 0, 0, 0, // mov eax, 17 (skipped while ZF is set)
+    } ++ syscall));
+
+    // DEC 0 is not signed overflow, though the result 0xffffffff is negative:
+    // the old a ^ res form set OF here, so `dec; jle` fell through.
+    m.regs.rax = 0;
+    try t.expectEqual(EV_BUDGET, m.run(1));
+    try t.expectEqual(@as(u64, 0xffff_ffff), m.regs.rax);
+    try t.expectEqual(@as(u64, 0), flags(&m) & state.OF);
+    try t.expect(flags(&m) & state.SF != 0);
+
+    // DEC of the minimum signed value is signed overflow.
+    m.regs.rip = 0x1000;
+    m.regs.rax = 0x8000_0000;
+    try t.expectEqual(EV_BUDGET, m.run(1));
+    try t.expectEqual(@as(u64, 0x7fff_ffff), m.regs.rax);
+    try t.expect(flags(&m) & state.OF != 0);
+
+    // INC into the sign bit is signed overflow; INC 0xffffffff is not.
+    m.regs.rip = 0x1002;
+    m.regs.rax = 0x7fff_ffff;
+    try t.expectEqual(EV_BUDGET, m.run(1));
+    try t.expectEqual(@as(u64, 0x8000_0000), m.regs.rax);
+    try t.expect(flags(&m) & state.OF != 0);
+    m.regs.rip = 0x1002;
+    m.regs.rax = 0xffff_ffff;
+    try t.expectEqual(EV_BUDGET, m.run(1));
+    try t.expectEqual(@as(u64, 0), m.regs.rax);
+    try t.expectEqual(@as(u64, state.ZF), flags(&m) & (state.OF | state.ZF));
+
+    // dec 0; inc -> 0; ZF set, so jle skips `mov eax, 17`.
+    m.regs.rip = 0x1000;
+    m.regs.rax = 0;
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual(@as(u64, 0), m.regs.rax);
+}
+
 test "x86_64: shifts by imm and CL, sar sign fill" {
     var m = try Machine.init(t.allocator);
     defer m.deinit();
@@ -198,6 +242,33 @@ test "x86_64: stack, call/ret and leave" {
     n.code(0x1000, &([_]u8{ 0xc9, 0x50 } ++ syscall)); // leave; push rax
     try t.expectEqual(EV_SYSCALL, n.run(100));
     try t.expectEqual(@as(u64, 0x1234_5678), n.regs.rbp);
+}
+
+test "x86_64: pop [rsp] addresses after the increment, pop rsp loads rsp" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.mapData(0x80000, 1);
+    m.regs.rsp = 0x80080;
+    const val: u64 = 0x1122_3344_5566_7788;
+    @memcpy(m.at(0x80080)[0..8], std.mem.asBytes(&val));
+    @memcpy(m.at(0x80088)[0..8], std.mem.asBytes(&@as(u64, 0)));
+    m.code(0x1000, &([_]u8{ 0x8f, 0x04, 0x24 } ++ syscall)); // pop qword [rsp]
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual(@as(u64, 0x80088), m.regs.rsp);
+    var got: u64 = undefined;
+    @memcpy(std.mem.asBytes(&got), m.at(0x80088)[0..8]);
+    try t.expectEqual(val, got); // the JIT's return-address restore
+
+    var n = try Machine.init(t.allocator);
+    defer n.deinit();
+    n.mapData(0x80000, 1);
+    n.regs.rsp = 0x80080;
+    const sp2: u64 = 0x800a0;
+    @memcpy(n.at(0x80080)[0..8], std.mem.asBytes(&sp2));
+    n.code(0x1000, &([_]u8{ 0x5c, 0x8f, 0xc4 } ++ syscall)); // pop rsp; pop rsp
+    @memcpy(n.at(0x800a0)[0..8], std.mem.asBytes(&@as(u64, 0x800c0)));
+    try t.expectEqual(EV_SYSCALL, n.run(100));
+    try t.expectEqual(@as(u64, 0x800c0), n.regs.rsp);
 }
 
 test "x86_64: memory forms (SIB, disp, RIP-relative), movzx/movsx/lea" {
