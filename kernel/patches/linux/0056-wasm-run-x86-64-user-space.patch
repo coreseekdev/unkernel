@@ -1,4 +1,4 @@
-From 1786d29392c0582609de617d23a0c5f86bedcee8 Mon Sep 17 00:00:00 2001
+From 1a842099e547dd2974ef731588e851a83def4f1f Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Thu, 26 Nov 2026 22:33:16 +0800
 Subject: [PATCH] wasm: run x86-64 user space
@@ -34,23 +34,26 @@ and powers the kernel off.
  arch/wasm/include/asm/processor.h       |  10 +
  arch/wasm/include/asm/ptrace.h          |  37 ++-
  arch/wasm/include/asm/seccomp.h         |  11 +-
+ arch/wasm/include/asm/stat.h            |  50 ++++
  arch/wasm/include/asm/syscall.h         |  65 ++++-
  arch/wasm/include/asm/syscall_wrapper.h |   7 +
  arch/wasm/include/asm/unistd.h          |  14 ++
+ arch/wasm/include/uapi/asm/fcntl.h      |   9 +
  arch/wasm/include/uapi/asm/prctl.h      |  14 ++
  arch/wasm/kernel/Makefile.syscalls      |  11 +-
  arch/wasm/kernel/cpu.c                  |  35 +++
  arch/wasm/kernel/process.c              |  35 ++-
  arch/wasm/kernel/prof.c                 |   8 +-
  arch/wasm/kernel/ptrace.c               |  31 +++
- arch/wasm/kernel/signal.c               | 302 ++++++++++++++++++++++++
+ arch/wasm/kernel/signal.c               | 305 ++++++++++++++++++++++++
  arch/wasm/kernel/sys.c                  |  56 +++++
  arch/wasm/kernel/syscall_table.c        |   9 +-
  arch/wasm/kernel/traps.c                |  44 +++-
  arch/wasm/mm/fault.c                    |   6 +-
  arch/wasm/mm/sigpage.c                  |   7 +
- 23 files changed, 795 insertions(+), 52 deletions(-)
+ 25 files changed, 857 insertions(+), 52 deletions(-)
  create mode 100644 arch/wasm/configs/kw_x86.config
+ create mode 100644 arch/wasm/include/asm/stat.h
  create mode 100644 arch/wasm/include/uapi/asm/prctl.h
 
 diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
@@ -454,6 +457,62 @@ index 184470417..35057bdf4 100644
 +#endif
  
  #endif /* _ASM_WASM_SECCOMP_H */
+diff --git a/arch/wasm/include/asm/stat.h b/arch/wasm/include/asm/stat.h
+new file mode 100644
+index 000000000..712a2cfd7
+--- /dev/null
++++ b/arch/wasm/include/asm/stat.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * struct stat for the guest user ABI. AArch64 (and the asm-generic layout)
++ * is the default. x86-64's newfstatat/fstat use their own struct stat (see
++ * arch/x86/include/uapi/asm/stat.h), so a CONFIG_WASM_USER_X86_64 build
++ * has to hand that layout to fs/stat.c's cp_new_stat().
++ */
++#ifndef __ASM_STAT_H
++#define __ASM_STAT_H
++
++#ifdef CONFIG_WASM_USER_X86_64
++
++#include <asm/posix_types.h>
++
++struct stat {
++	__kernel_ulong_t	st_dev;
++	__kernel_ulong_t	st_ino;
++	__kernel_ulong_t	st_nlink;
++
++	unsigned int		st_mode;
++	unsigned int		st_uid;
++	unsigned int		st_gid;
++	unsigned int		__pad0;
++	__kernel_ulong_t	st_rdev;
++	__kernel_long_t		st_size;
++	__kernel_long_t		st_blksize;
++	__kernel_long_t		st_blocks;
++
++	__kernel_ulong_t	st_atime;
++	__kernel_ulong_t	st_atime_nsec;
++	__kernel_ulong_t	st_mtime;
++	__kernel_ulong_t	st_mtime_nsec;
++	__kernel_ulong_t	st_ctime;
++	__kernel_ulong_t	st_ctime_nsec;
++	__kernel_long_t		__unused[3];
++};
++
++#define INIT_STRUCT_STAT_PADDING(st) do {	\
++	st.__pad0 = 0;				\
++	st.__unused[0] = 0;			\
++	st.__unused[1] = 0;			\
++	st.__unused[2] = 0;			\
++} while (0)
++
++#else /* !CONFIG_WASM_USER_X86_64 */
++
++#include <asm-generic/stat.h>
++
++#endif
++#endif
 diff --git a/arch/wasm/include/asm/syscall.h b/arch/wasm/include/asm/syscall.h
 index 4c3e07741..c8ae7c49f 100644
 --- a/arch/wasm/include/asm/syscall.h
@@ -594,6 +653,33 @@ index 0c377ee8f..681d8af18 100644
  
  #include <uapi/asm/unistd.h>
  
+diff --git a/arch/wasm/include/uapi/asm/fcntl.h b/arch/wasm/include/uapi/asm/fcntl.h
+index e503fdb74..3078ca551 100644
+--- a/arch/wasm/include/uapi/asm/fcntl.h
++++ b/arch/wasm/include/uapi/asm/fcntl.h
+@@ -17,6 +17,13 @@
+ #ifndef __ASM_FCNTL_H
+ #define __ASM_FCNTL_H
+ 
++#ifdef CONFIG_WASM_USER_X86_64
++
++/* x86-64 user space uses the asm-generic O_* bits (an O_LARGEFILE of
++ * 0 is only a libc-side spelling; the kernel bit may still exist). */
++
++#else /* !CONFIG_WASM_USER_X86_64 */
++
+ /*
+  * Using our own definitions for AArch32 (compat) support.
+  */
+@@ -25,6 +32,8 @@
+ #define O_DIRECT	(1 << 16)	/* direct disk access hint - currently ignored */
+ #define O_LARGEFILE	(1 << 17)
+ 
++#endif /* CONFIG_WASM_USER_X86_64 */
++
+ #include <asm-generic/fcntl.h>
+ 
+ #endif
 diff --git a/arch/wasm/include/uapi/asm/prctl.h b/arch/wasm/include/uapi/asm/prctl.h
 new file mode 100644
 index 000000000..cf19aa607
@@ -860,7 +946,7 @@ index 96f8810cf..f8adc5e09 100644
 +
 +#endif
 diff --git a/arch/wasm/kernel/signal.c b/arch/wasm/kernel/signal.c
-index 040dd1c65..161830c06 100644
+index 040dd1c65..c0fa16921 100644
 --- a/arch/wasm/kernel/signal.c
 +++ b/arch/wasm/kernel/signal.c
 @@ -29,6 +29,8 @@
@@ -872,7 +958,7 @@ index 040dd1c65..161830c06 100644
  struct rt_sigframe {
  	struct siginfo info;
  	struct ucontext uc;
-@@ -322,3 +324,303 @@ static int __init init_signal_minsigstksz(void)
+@@ -322,3 +324,306 @@ static int __init init_signal_minsigstksz(void)
  	return 0;
  }
  arch_initcall(init_signal_minsigstksz);
@@ -954,7 +1040,10 @@ index 040dd1c65..161830c06 100644
 +	if (regs->user.rsp & 7)
 +		goto badframe;
 +
-+	frame = (struct rt_sigframe_x86 __user *)regs->user.rsp;
++	/* The handler returns through pretcode (the SA_RESTORER stub), so by
++	 * the time the stub issues rt_sigreturn that word has been popped and
++	 * rsp points just past it. Linux reads the frame from rsp - 8. */
++	frame = (struct rt_sigframe_x86 __user *)(regs->user.rsp - sizeof(__u64));
 +	if (!access_ok(frame, sizeof(*frame)))
 +		goto badframe;
 +	sc = &frame->uc.uc_mcontext;

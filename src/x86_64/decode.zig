@@ -652,11 +652,16 @@ pub fn one(s: common.St, out: *Insn) common.DecodeError!void {
             ins.form = 0x8f;
             ins.opsz = if (pfx.opsz16) 2 else 8;
         },
-        0x90 => ins.op = .nop,
-        0x91...0x97 => {
-            ins.op = .xchg;
-            ins.form = 0x90;
-            ins.rm = @as(u4, @intCast(op & 7)) | (pfx.rexB() << 3);
+        0x90...0x97 => {
+            // 0x90 is NOP only without REX.B; with it the encoding is
+            // xchg %rax,%r8 (compilers emit 49 90 for that).
+            if (op == 0x90 and pfx.rexB() == 0) {
+                ins.op = .nop;
+            } else {
+                ins.op = .xchg;
+                ins.form = 0x90;
+                ins.rm = @as(u4, @intCast(op & 7)) | (pfx.rexB() << 3);
+            }
         },
         0x98 => ins.op = .cbw,
         0x99 => ins.op = .cwd,
@@ -931,6 +936,7 @@ fn twoByte(d: *Dec) common.DecodeError!void {
         0xa3 => {
             try d.modrm();
             ins.op = .bt;
+            ins.imm = 0x100; // bit index in ModRM.reg
         },
         0xa4 => {
             try d.modrm();
@@ -945,6 +951,7 @@ fn twoByte(d: *Dec) common.DecodeError!void {
         0xab => {
             try d.modrm();
             ins.op = .bts;
+            ins.imm = 0x100; // bit index in ModRM.reg
         },
         0xac => {
             try d.modrm();
@@ -986,6 +993,7 @@ fn twoByte(d: *Dec) common.DecodeError!void {
         0xb3 => {
             try d.modrm();
             ins.op = .btr;
+            ins.imm = 0x100; // bit index in ModRM.reg
         },
         0xb6, 0xb7 => {
             try d.modrm();
@@ -1008,6 +1016,7 @@ fn twoByte(d: *Dec) common.DecodeError!void {
         0xbb => {
             try d.modrm();
             ins.op = .btc;
+            ins.imm = 0x100; // bit index in ModRM.reg
         },
         0xbc => {
             try d.modrm();

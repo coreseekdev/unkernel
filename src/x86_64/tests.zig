@@ -297,6 +297,74 @@ test "x86_64: SSE2 packed add, movdqu load/store" {
     try t.expectEqual(@as(u32, 44), got[3]);
 }
 
+test "x86_64: SSE2 byte shifts name their register in ModRM.rm" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.regs.xmm[2] = .{ 0x0102_0304_0506_0708, 0x1112_1314_1516_1718 };
+    m.regs.xmm[7] = .{ 0xaaaa_bbbb_cccc_dddd, 0xeeee_ffff_0000_1111 };
+    m.regs.xmm[3] = .{ 0x2122_2324_2526_2728, 0x3132_3334_3536_3738 };
+    m.code(0x1000, &([_]u8{
+        // pslldq $4, xmm2: ModRM.reg=7 is the opcode extension, so the
+        // operand is xmm2 and xmm7 must stay untouched.
+        0x66, 0x0f, 0x73, 0xfa, 0x04, // pslldq xmm2, 4
+        // psrldq $4, xmm3: ModRM.reg=3.
+        0x66, 0x0f, 0x73, 0xdb, 0x04, // psrldq xmm3, 4
+    } ++ syscall));
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual([2]u64{ 0x0506_0708_0000_0000, 0x1516_1718_0102_0304 }, m.regs.xmm[2]);
+    try t.expectEqual([2]u64{ 0xaaaa_bbbb_cccc_dddd, 0xeeee_ffff_0000_1111 }, m.regs.xmm[7]);
+    try t.expectEqual([2]u64{ 0x3536_3738_2122_2324, 0x0000_0000_3132_3334 }, m.regs.xmm[3]);
+}
+
+test "x86_64: register bt/bts/btr/btc use ModRM.reg as the bit index" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.mapData(0x20000, 1);
+    m.at(0x20000)[0] = 0x80;
+    m.at(0x20001)[0] = 0x01;
+    m.code(0x1000, &([_]u8{
+        0x48, 0xc7, 0xc0, 0x00, 0x22, 0x00, 0x00, // mov rax, 0x2200
+        0x48, 0xc7, 0xc1, 0x23, 0x00, 0x00, 0x00, // mov rcx, 35
+        0x48, 0x0f, 0xa3, 0xc8, // bt rcx, rax -> bit 35 (0x2200 has it clear)
+        0x48, 0x0f, 0xab, 0xc8, // bts rcx, rax -> set bit 35
+        0x48, 0x0f, 0xa3, 0xc8, // bt rcx, rax -> now set
+        0x48, 0x0f, 0xbb, 0xc8, // btc rcx, rax -> clear it, CF=1
+        0x48, 0x89, 0x04, 0x25, 0x08, 0x00, 0x02, 0x00, // mov [0x20008], rax
+        0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff, // mov rcx, -1
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x02, 0x00, // mov rax, 0x20001
+        0x48, 0x0f, 0xa3, 0x08, // bt rcx, [rax] -> [0x20000] bit 7 = 1
+    } ++ syscall));
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual(@as(u64, 0x20001), m.regs.rax);
+    try t.expectEqual(@as(u64, 0x2200), std.mem.readInt(u64, m.at(0x20008)[0..8], .little));
+    try t.expect(flags(&m) & state.CF != 0);
+}
+
+test "x86_64: backward rep movsb after std copies an overlapping range" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.mapData(0x20000, 1);
+    for (0..0x40) |i| m.at(0x20000)[i] = @intCast(i);
+    m.regs.rdi = 0x20010;
+    m.regs.rsi = 0x20000;
+    m.regs.rdx = 0x20;
+    m.code(0x1000, &([_]u8{
+        0x48, 0x89, 0xd1, // mov rcx, rdx
+        0x48, 0x8d, 0x7c, 0x17, 0xff, // lea -1(rdi,rdx), rdi
+        0x48, 0x8d, 0x74, 0x16, 0xff, // lea -1(rsi,rdx), rsi
+        0xfd, // std
+        0xf3, 0xa4, // rep movsb
+        0xfc, // cld
+    } ++ syscall));
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual(@as(u8, 0x00), m.at(0x20010)[0]);
+    try t.expectEqual(@as(u8, 0x1f), m.at(0x2002f)[0]);
+    try t.expectEqual(@as(u8, 0x30), m.at(0x20030)[0]);
+    // SYSCALL leaves the return rip in rcx, so check the copy itself.
+    try t.expectEqual(@as(u64, 0x2000f), m.regs.rdi);
+    try t.expectEqual(@as(u64, 0x1ffff), m.regs.rsi);
+}
+
 test "x86_64: SSE scalar float, conversion and MXCSR" {
     var m = try Machine.init(t.allocator);
     defer m.deinit();
@@ -416,6 +484,19 @@ test "x86_64: bswap, popcnt, tzcnt, bt, cmpxchg and xadd" {
     try t.expectEqual(@as(u64, 10), m.regs.rax);
     try t.expect(flags(&m) & state.ZF == 0);
     try t.expectEqual(@as(u64, 10), std.mem.readInt(u64, m.at(0x20000)[0..8], .little));
+}
+
+test "x86_64: 49 90 is xchg rax, r8, not a nop" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.code(0x1000, &([_]u8{
+        0x48, 0xc7, 0xc0, 0x22, 0x11, 0x00, 0x00, // mov rax, 0x1122
+        0x49, 0xc7, 0xc0, 0x44, 0x33, 0x00, 0x00, // mov r8, 0x3344
+        0x49, 0x90, // xchg rax, r8
+    } ++ syscall));
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual(@as(u64, 0x3344), m.regs.rax);
+    try t.expectEqual(@as(u64, 0x1122), m.regs.r8);
 }
 
 test "x86_64: a faulting push and pop leave rsp unchanged" {

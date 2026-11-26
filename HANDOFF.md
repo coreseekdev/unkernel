@@ -7,7 +7,7 @@ Status: phase 0 and the phase 1 reference interpreter are implemented and
 tested; phases 2-5 are the next rounds. See "Current state" below before
 starting.
 
-## Current state (2026-11-26)
+## Current state (2026-11-27)
 
 Done in this tree:
 
@@ -42,27 +42,43 @@ Done in this tree:
   `TASK_SIZE`, x86 `uname -m`, `/proc/cpuinfo`, seccomp arch and the
   matching ptrace/core-dump gating. `KW_USER_ISA=x86_64
   kernel/build.sh kernel` builds it into `vendor/build/kernel-x86_64/`
-  (the AArch64 outputs are untouched). A static x86-64 init runs through
-  the real kernel (syscalls, `arch_prctl`, signals, fork/exec/wait, power
-  off).
-- **Remaining phase 2 work:** Alpine's dynamic loader starts but faults
-  (the x86-64 dynamic ELF path and the loader's own emulation still need
-  work); Debian's static BusyBox reaches its shell but an applet command
-  (`true`, `uname`) still crashes in `ash`'s applet/lookup path. The
-  immediate cause is glibc's aligned `__strcmp_sse2`: it returns 0 for
-  some unequal pairs (`"abc"`/`"abd"`; `__strcmp_sse2_unaligned` is
-  correct), so `ash` reads the token `true` as `then`. The emulator's
-  handling of that function's alignment/jump-table path is the remaining
-  bug. The harness's `getcwd`, `rt_sigaction` query and `prctl` are
-  implemented so the same path can be reproduced under `kwemu-harness-x86`. x86-64 ptrace regsets and core-dump notes are not
-  implemented (`HAVE_ARCH_TRACEHOOK` stays off for x86); x87 is a precise
-  #UD; the decoded-op tier and wasm JIT are phase 4; riscv64 is phase 3.
+  (the AArch64 outputs are untouched; the fresh-tree path applies 0056 to
+  the vendor tree). A static x86-64 init, the static Debian BusyBox
+  rootfs (fork/exec/wait, applets, `ls`, `poweroff`) and the Alpine
+  3.20.3 minirootfs (dynamic `ld-musl` and BusyBox: `mount`, `uname`,
+  `ls`, `cat`, `grep`, `sed`, `md5sum`/`sha256sum`, `ps`, `/proc`, power
+  off) run through the real kernel on both `vmlinux` and
+  `vmlinux32.wasm`.
+- **Emulator bugs found by real user space** (each now has a native unit
+  test): `PSLLDQ`/`PSRLDQ` must name ModRM.rm (the code wrote the
+  extension register, breaking glibc's aligned `__strcmp_sse2` and
+  BusyBox applet lookup); `BT`/`BTS`/`BTR`/`BTC` register forms must use
+  ModRM.reg as the bit index (musl's GNU-hash bloom then skipped
+  `__dls3`); `49 90` is `xchg %rax,%r8`, not a NOP (the loader's
+  `find_sym` returned through it); and the `DF=1` string step has to be
+  computed in 64 bits (`0 -% sz` with `sz: u8` wrapped to `0xff`, so
+  every backward `rep movsb`/`stos`/`cmps` moved by 255). The earlier
+  immediate packed-shift clobber (ModRM.reg overwritten) is also fixed.
+- **Kernel fixes in 0056:** `rt_sigreturn` reads the frame at `rsp - 8`
+  because the return through `sa_restorer` has already popped
+  `pretcode`; `CONFIG_WASM_USER_X86_64` selects x86-64's `struct stat`
+  (`arch/wasm/include/asm/stat.h`) and the asm-generic `O_*` bits
+  (`arch/wasm/include/uapi/asm/fcntl.h`), which fixed `stat`/`ls`/PATH
+  lookup and `open(O_DIRECTORY)`.
+- **Remaining phase 2 work:** x87 is still a precise #UD, so Alpine's
+  `seq` and `awk` (musl's long-double path: `fildl`, `fldt`, `fstpt`,
+  `fmulp`) trap SIGILL; `df` reports "can't find mount point" although
+  `stat`/`statfs` values look sane, so the mount-table match is the next
+  lead; x86-64 ptrace regsets and core-dump notes are not implemented
+  (`HAVE_ARCH_TRACEHOOK` stays off for x86); AVX/SSSE3/SSE4 are not
+  advertised; the decoded-op tier and wasm JIT are phase 4; riscv64 is
+  phase 3.
 
-The next round continues phase 2 from the x86-64 kernel patch: finish the
-dynamic loader/Alpine path, then the static BusyBox shell (the remaining
-`ash` applet lookup bug), then threads/futex/signal conformance with
-kwtest/abitest. Keep the reference interpreter as the oracle for the
-decoded-op tier and reuse the guest corpus.
+The next round implements x87 (the stack plus long double loads/stores,
+arithmetic, comparisons, conversions and `fxam`/`fnstsw`/control words),
+then the `df` mount-point match, then threads/futex/signal conformance
+with kwtest/abitest. Keep the reference interpreter as the oracle for
+the decoded-op tier and reuse the guest corpus.
 
 ## 1. Objective and priorities
 

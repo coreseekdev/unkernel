@@ -729,7 +729,12 @@ fn shldShrd(s: St, ins: *const Insn) Error!Exit {
 fn bitTest(s: St, ins: *const Insn) Error!Exit {
     const sz = ins.opsz;
     const bits: u8 = sz * 8;
-    const idx: u64 = ins.imm;
+    // 0x100 marks the register forms, whose bit index is ModRM.reg (the
+    // same sentinel shld/shrd use for CL).
+    const idx: u64 = if (ins.imm == 0x100)
+        common.regRead(s.r, ins.reg, sz, ins.pfx.rex != 0)
+    else
+        ins.imm;
     var addr = ins.ea;
     var width: u8 = sz;
     var v: u64 = undefined;
@@ -856,7 +861,9 @@ fn cmov(s: St, ins: *const Insn) Error!Exit {
 fn stringOp(s: St, ins: *const Insn) Error!Exit {
     const sz = ins.opsz;
     const addr32 = ins.pfx.addr32;
-    const step: u64 = if (s.r.eflags & state.DF != 0) 0 -% sz else sz;
+    // The subtraction has to be 64-bit: `0 -% sz` with sz: u8 would wrap
+    // in 8 bits and make the backward step 0xff instead of -1.
+    const step: u64 = if (s.r.eflags & state.DF != 0) 0 -% @as(u64, sz) else sz;
     const rep = ins.pfx.rep;
     const have_rep = (ins.op == .movs and rep == 0xf3) or (ins.op == .stos and rep == 0xf3) or
         (ins.op == .lods and rep == 0xf3) or (ins.op == .scas and rep != 0) or (ins.op == .cmps and rep != 0);
@@ -1631,21 +1638,24 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
         },
         .pslldq, .psrldq => {
             // Byte shifts on the two halves: an array shift here becomes a
-            // memcpy call, which the kernel does not link.
+            // memcpy call, which the kernel does not link. These forms name
+            // their register in ModRM.rm (ModRM.reg is the opcode
+            // extension), so `dst` (xmm[reg]) is not the operand.
+            const d = &s.r.xmm[ins.rm];
             const n: u32 = imm & 0xff;
             const b: u32 = n * 8;
-            const v = dst.*;
+            const v = d.*;
             if (n >= 16) {
-                dst.* = .{ 0, 0 };
+                d.* = .{ 0, 0 };
             } else if (b == 0) {
                 // unchanged
             } else if (ins.sse == .pslldq) {
-                dst.* = if (b < 64)
+                d.* = if (b < 64)
                     .{ v[0] << @intCast(b), (v[1] << @intCast(b)) | (v[0] >> @intCast(64 - b)) }
                 else
                     .{ 0, v[0] << @intCast(b - 64) };
             } else {
-                dst.* = if (b < 64)
+                d.* = if (b < 64)
                     .{ (v[0] >> @intCast(b)) | (v[1] << @intCast(64 - b)), v[1] >> @intCast(b) }
                 else
                     .{ v[1] >> @intCast(b - 64), 0 };
