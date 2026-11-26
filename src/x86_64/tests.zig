@@ -274,6 +274,50 @@ test "x86_64: rep movsb and rep stosb" {
     try t.expectEqual(@as(u64, 0x21006), m.regs.rdi);
 }
 
+test "x86_64: x87 integer/float stack, faddp, fstpt and fxam" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.mapData(0x20000, 1);
+    // [0x20000] = 7 (i32)
+    m.at(0x20000)[0] = 7;
+    m.regs.rax = 0x20000;
+    m.code(0x1000, &([_]u8{
+        0xdb, 0x00, // fildl (%rax) -> st0 = 7
+        0xd9, 0xe8, // fld1 -> st0 = 1, st1 = 7
+        0xde, 0xc1, // faddp %st, %st(1) -> st0 = 8, pop
+        0xdb, 0x18, // fistpl (%rax) -> [0x20000] = 8
+        0xd9, 0xe8, // fld1
+        0xd9, 0xe8, // fld1
+        0xde, 0xc1, // faddp -> 2
+        0xdb, 0x78, 0x08, // fstpt 8(%rax) -> 80-bit 2.0
+        0xdb, 0x68, 0x08, // fldt 8(%rax)
+        0xdb, 0x18, // fistpl (%rax) -> [0x20000] = 2
+        0xd9, 0xe8, // fld1
+        0xd9, 0xe5, // fxam
+        0xdf, 0xe0, // fnstsw %ax
+    } ++ syscall));
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual(@as(i32, 2), std.mem.readInt(i32, m.at(0x20000)[0..4], .little));
+    try t.expectEqual(@as(u8, 0x00), m.at(0x20008)[8]);
+    try t.expectEqual(@as(u8, 0x40), m.at(0x20008)[9]);
+    // fld1 left TOP at 7; fxam's C2 (normal) and TOP are in AX.
+    try t.expectEqual(@as(u64, 0x3c00), m.regs.rax & 0xffff);
+}
+
+test "x86_64: x87 fucomip sets EFLAGS" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.code(0x1000, &([_]u8{
+        0xd9, 0xe8, // fld1  (st0 = 1)
+        0xd9, 0xee, // fldz  (st0 = 0, st1 = 1)
+        0xdf, 0xe9, // fucomip %st(1), %st  (0 < 1 -> CF=1)
+    } ++ syscall));
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expect(flags(&m) & state.CF != 0);
+    try t.expect(flags(&m) & state.ZF == 0);
+    try t.expect(flags(&m) & state.PF == 0);
+}
+
 test "x86_64: SSE2 packed add, movdqu load/store" {
     var m = try Machine.init(t.allocator);
     defer m.deinit();

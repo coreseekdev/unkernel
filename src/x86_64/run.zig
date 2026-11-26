@@ -36,6 +36,14 @@ comptime {
         std.debug.assert(@offsetOf(Regs, f) == off);
     }
     std.debug.assert(@offsetOf(Regs, "xmm") == 224);
+    std.debug.assert(@offsetOf(Regs, "x87") == 480);
+    std.debug.assert(@offsetOf(Regs, "fcw") == 608);
+    std.debug.assert(@offsetOf(Regs, "fsw") == 610);
+    std.debug.assert(@offsetOf(Regs, "ftw") == 612);
+    std.debug.assert(@offsetOf(Regs, "fop") == 614);
+    std.debug.assert(@offsetOf(Regs, "fip") == 616);
+    std.debug.assert(@offsetOf(Regs, "fdp") == 624);
+    std.debug.assert(@sizeOf(Regs) == 640);
     std.debug.assert(kw_h.KW_ABI_VERSION == kwemu.abi_version);
 }
 

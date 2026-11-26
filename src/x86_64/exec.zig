@@ -10,6 +10,9 @@
 const std = @import("std");
 const common = @import("common.zig");
 const decode = @import("decode.zig");
+comptime {
+    _ = @import("x87rt.zig");
+}
 const state = @import("state.zig");
 
 const Insn = decode.Insn;
@@ -138,7 +141,7 @@ pub fn one(s: St, ins: *const Insn) Error!Exit {
             const r = switch (sz) {
                 4 => @byteSwap(@as(u32, @truncate(v))),
                 8 => @byteSwap(v),
-                else => return common.ill(s, ins.raw),
+                else => unreachable,
             };
             common.regWrite(s.r, ins.rm, sz, ins.pfx.rex != 0, r);
             return .next;
@@ -159,6 +162,8 @@ pub fn one(s: St, ins: *const Insn) Error!Exit {
             s.r.rax = (s.r.rax & ~@as(u64, 0xff)) | b;
             return .next;
         },
+        .fxsave, .xsave => try fxsave(s, ins),
+        .fxrstor, .xrstor => try fxrstor(s, ins),
         .sse => try sseOp(s, ins),
         .fpu => try fpuOp(s, ins),
     };
@@ -202,7 +207,7 @@ fn alu(s: St, ins: *const Insn) Error!Exit {
             a = common.regRead(s.r, 0, sz, ins.pfx.rex != 0);
             b = ins.imm;
         },
-        else => return common.ill(s, ins.raw),
+        else => unreachable,
     }
     const m = common.mask(sz);
     const res: u64 = switch (ins.op) {
@@ -306,7 +311,7 @@ fn movOp(s: St, ins: *const Insn) Error!Exit {
         0xc6 => { // r/m <- imm
             try rmWrite(s, ins, ins.opsz, ins.imm);
         },
-        else => return common.ill(s, ins.raw),
+        else => unreachable,
     }
     return .next;
 }
@@ -1057,11 +1062,12 @@ fn cpuid(s: St) Error!Exit {
         1 => {
             a = 0x0006_06a3; // family 6, model 6, stepping 3
             b = 0;
-            c = 0; // no SSE3+, no AVX, no OSXSAVE
+            c = 0; // baseline only: no SSE3+/SSSE3/SSE4/POPCNT/CX16
             d = (1 << 0) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 11) |
-                (1 << 13) | (1 << 15) | (1 << 19) | (1 << 24) | (1 << 25) | (1 << 26);
-            // FPU, TSC, MSR, PAE, CX8, SEP, PGE, CMOV, CLFSH, FXSR, SSE,
-            // SSE2.
+                (1 << 13) | (1 << 15) | (1 << 19) | (1 << 23) | (1 << 24) |
+                (1 << 25) | (1 << 26);
+            // FPU, TSC, MSR, PAE, CX8, SEP, PGE, CMOV, CLFSH, MMX, FXSR,
+            // SSE, SSE2.
         },
         7 => {
             a = 0;
@@ -1671,7 +1677,7 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
             const w = u16s(s.r.xmm[ins.rm])[imm & 7];
             common.regWrite(s.r, ins.reg, 4, ins.pfx.rex != 0, w);
         },
-        else => return common.ill(s, ins.raw),
+        else => unreachable,
     }
     return .next;
 }
@@ -1967,12 +1973,381 @@ fn packShift(op: Sse, v: Vec, count: u32) Vec {
     }
 }
 
+// ---- FXSAVE/FXRSTOR --------------------------------------------------------------
+
+fn xsaveWrite(s: St, ins: *const Insn, off: u64, v: u64) Error!void {
+    try common.writeMem(s, ins.ea + off, 8, ins.pfx.seg, v);
+}
+fn xsaveRead(s: St, ins: *const Insn, off: u64) Error!u64 {
+    return common.readMem(s, ins.ea + off, 8, ins.pfx.seg);
+}
+
+fn fxsave(s: St, ins: *const Insn) Error!Exit {
+    const r = s.r;
+    try xsaveWrite(s, ins, 0, (@as(u64, r.fop) << 48) | (@as(u64, r.ftw) << 32) |
+        (@as(u64, r.fsw) << 16) | r.fcw);
+    try xsaveWrite(s, ins, 8, r.fip);
+    try xsaveWrite(s, ins, 16, r.fdp);
+    try xsaveWrite(s, ins, 24, (@as(u64, 0xffff) << 32) | r.mxcsr);
+    for (0..8) |i| {
+        try xsaveWrite(s, ins, 32 + i * 16, r.x87[i][0]);
+        try xsaveWrite(s, ins, 40 + i * 16, r.x87[i][1]);
+    }
+    for (0..16) |i| {
+        try xsaveWrite(s, ins, 160 + i * 16, r.xmm[i][0]);
+        try xsaveWrite(s, ins, 168 + i * 16, r.xmm[i][1]);
+    }
+    return .next;
+}
+
+fn fxrstor(s: St, ins: *const Insn) Error!Exit {
+    const r = s.r;
+    const w = try xsaveRead(s, ins, 0);
+    r.fcw = @truncate(w);
+    r.fsw = @truncate(w >> 16);
+    r.ftw = @truncate(w >> 32);
+    r.fop = @truncate(w >> 48);
+    r.fip = try xsaveRead(s, ins, 8);
+    r.fdp = try xsaveRead(s, ins, 16);
+    r.mxcsr = @truncate(try xsaveRead(s, ins, 24));
+    for (0..8) |i| {
+        r.x87[i][0] = try xsaveRead(s, ins, 32 + i * 16);
+        r.x87[i][1] = try xsaveRead(s, ins, 40 + i * 16) & 0xffff;
+    }
+    for (0..16) |i| {
+        r.xmm[i][0] = try xsaveRead(s, ins, 160 + i * 16);
+        r.xmm[i][1] = try xsaveRead(s, ins, 168 + i * 16);
+    }
+    return .next;
+}
+
 // ---- x87 -------------------------------------------------------------------------
 
 fn fpuOp(s: St, ins: *const Insn) Error!Exit {
-    // The stack is not modelled in struct kw_regs; long double in the kernel
-    // ABI needs it, which is a later phase. Every x87 instruction is a
-    // precise #UD until then, so a guest that needs it fails visibly rather
-    // than computing wrong values.
-    return common.ill(s, ins.raw);
+    const r = s.r;
+    switch (ins.fpu) {
+        .fld => {
+            if (ins.mem) {
+                x87Push(s, try x87LoadMem(s, ins));
+            } else {
+                x87Push(s, x87Get(r, @intCast(ins.rm & 7)));
+            }
+        },
+        .fst => {
+            const v = x87Get(r, 0);
+            if (ins.mem) try x87StoreMem(s, ins, v) else x87Set(r, @intCast(ins.rm & 7), v);
+        },
+        .fstp => {
+            const v = x87Get(r, 0);
+            if (ins.mem) try x87StoreMem(s, ins, v) else x87Set(r, @intCast(ins.rm & 7), v);
+            x87Pop(r);
+        },
+        .fild => {
+            if (!ins.mem) return common.ill(s, ins.raw);
+            const v: i64 = switch (ins.opsz) {
+                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg))))),
+                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg))))),
+                8 => @bitCast(try common.readMem(s, ins.ea, 8, ins.pfx.seg)),
+                else => unreachable,
+            };
+            x87Push(s, @floatFromInt(v));
+        },
+        .fist, .fistp => {
+            if (!ins.mem) return common.ill(s, ins.raw);
+            const v: i64 = @intFromFloat(x87Round(r, x87Get(r, 0)));
+            switch (ins.opsz) {
+                2 => try common.writeMem(s, ins.ea, 2, ins.pfx.seg, @as(u16, @truncate(@as(u64, @bitCast(@as(i64, @as(i16, @truncate(v)))))))),
+                4 => try common.writeMem(s, ins.ea, 4, ins.pfx.seg, @as(u32, @truncate(@as(u64, @bitCast(@as(i64, @as(i32, @truncate(v)))))))),
+                8 => try common.writeMem(s, ins.ea, 8, ins.pfx.seg, @bitCast(v)),
+                else => unreachable,
+            }
+            if (ins.fpu == .fistp) x87Pop(r);
+        },
+        .fadd, .fsub, .fsubr, .fmul, .fdiv, .fdivr => {
+            const other: f80 = if (ins.mem) try x87LoadMem(s, ins) else x87Get(r, @intCast(ins.rm & 7));
+            const a = x87Get(r, 0);
+            if (ins.aux == 1) {
+                const dst: u3 = @intCast(ins.rm & 7);
+                const b = x87Get(r, dst);
+                x87Set(r, dst, switch (ins.fpu) {
+                    .fadd => b + a,
+                    .fsub => b - a,
+                    .fsubr => a - b,
+                    .fmul => b * a,
+                    .fdiv => b / a,
+                    .fdivr => a / b,
+                    else => unreachable,
+                });
+            } else {
+                x87Set(r, 0, switch (ins.fpu) {
+                    .fadd => a + other,
+                    .fsub => a - other,
+                    .fsubr => other - a,
+                    .fmul => a * other,
+                    .fdiv => a / other,
+                    .fdivr => other / a,
+                    else => unreachable,
+                });
+            }
+        },
+        .fiadd, .fisub, .fisubr, .fimul, .fidiv, .fidivr => {
+            if (!ins.mem) return common.ill(s, ins.raw);
+            const iv: i64 = switch (ins.opsz) {
+                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg))))),
+                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg))))),
+                else => unreachable,
+            };
+            const other: f80 = @floatFromInt(iv);
+            const a = x87Get(r, 0);
+            x87Set(r, 0, switch (ins.fpu) {
+                .fiadd => a + other,
+                .fisub => a - other,
+                .fisubr => other - a,
+                .fimul => a * other,
+                .fidiv => a / other,
+                .fidivr => other / a,
+                else => unreachable,
+            });
+        },
+        .faddp, .fmulp, .fsubp, .fsubrp, .fdivp, .fdivrp => {
+            const dst: u3 = @intCast(ins.rm & 7);
+            const a = x87Get(r, dst);
+            const b = x87Get(r, 0);
+            x87Set(r, dst, switch (ins.fpu) {
+                .faddp => a + b,
+                .fmulp => a * b,
+                .fsubp => a - b,
+                .fsubrp => b - a,
+                .fdivp => a / b,
+                .fdivrp => b / a,
+                else => unreachable,
+            });
+            x87Pop(r);
+        },
+        .fcom, .fcomp, .fucom, .fucomp => {
+            const other: f80 = if (ins.mem) try x87LoadMem(s, ins) else x87Get(r, @intCast(ins.rm & 7));
+            x87Compare(r, x87Get(r, 0), other);
+            if (ins.fpu == .fcomp or ins.fpu == .fucomp) x87Pop(r);
+        },
+        .fcompp, .fucompp => {
+            x87Compare(r, x87Get(r, 0), x87Get(r, 1));
+            x87Pop(r);
+            x87Pop(r);
+        },
+        .fucomi, .fcomi, .fucomip, .fcomip => {
+            const other: f80 = if (ins.mem) try x87LoadMem(s, ins) else x87Get(r, @intCast(ins.rm & 7));
+            x87CompareFlags(r, x87Get(r, 0), other);
+            if (ins.fpu == .fucomip or ins.fpu == .fcomip) x87Pop(r);
+        },
+        .ftst => x87Compare(r, x87Get(r, 0), 0),
+        .fxam => x87Exam(r, x87Get(r, 0)),
+        .fldcw => {
+            if (!ins.mem) return common.ill(s, ins.raw);
+            r.fcw = @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg));
+        },
+        .fnstcw => {
+            if (ins.mem) {
+                try common.writeMem(s, ins.ea, 2, ins.pfx.seg, r.fcw);
+            } else return common.ill(s, ins.raw);
+        },
+        .fnstsw => {
+            if (ins.mem) {
+                try common.writeMem(s, ins.ea, 2, ins.pfx.seg, r.fsw);
+            } else {
+                common.regWrite(r, 0, 2, ins.pfx.rex != 0, r.fsw);
+            }
+        },
+        .fninit => {
+            r.fcw = 0x037f;
+            r.fsw = 0;
+            r.ftw = 0xffff;
+        },
+        .fchs, .fabs => {
+            var u: u80 = @bitCast(x87Get(r, 0));
+            if (ins.fpu == .fchs) u ^= @as(u80, 1) << 79 else u &= ~(@as(u80, 1) << 79);
+            x87Set(r, 0, @bitCast(u));
+        },
+        .fsqrt => x87Set(r, 0, @sqrt(x87Get(r, 0))),
+        .frndint => x87Set(r, 0, x87Round(r, x87Get(r, 0))),
+        .fxch => {
+            const i: u3 = @intCast(ins.rm & 7);
+            const a = x87Get(r, 0);
+            const b = x87Get(r, i);
+            x87Set(r, 0, b);
+            x87Set(r, i, a);
+        },
+        .fld1 => x87Push(s, 1),
+        .fldz => x87Push(s, 0),
+        .fldpi => x87Push(s, @as(f80, 3.141592653589793238462643383279502884)),
+        .fldl2e => x87Push(s, @as(f80, 1.442695040888963407359924681001892137)),
+        .fldl2t => x87Push(s, @as(f80, 3.321928094887362347870319429489390176)),
+        .fldln2 => x87Push(s, @as(f80, 0.693147180559945309417232121458176568)),
+        .fldlg2 => x87Push(s, @as(f80, 0.301029995663981195213738894724493027)),
+        .fscale => {
+            const e: i32 = @intFromFloat(@trunc(x87Get(r, 1)));
+            x87Set(r, 0, std.math.scalbn(x87Get(r, 0), e));
+        },
+        .fprem => {
+            const a = x87Get(r, 0);
+            const b = x87Get(r, 1);
+            if (b == 0 or std.math.isNan(a) or std.math.isNan(b) or std.math.isInf(a)) {
+                x87Set(r, 0, std.math.nan(f80));
+            } else {
+                x87Set(r, 0, @mod(a, b));
+            }
+        },
+    }
+    return .next;
+}
+
+inline fn x87Top(r: *Regs) u3 {
+    return @intCast((r.fsw >> 11) & 7);
+}
+inline fn x87SetTop(r: *Regs, t: u3) void {
+    r.fsw = (r.fsw & ~@as(u16, 7 << 11)) | (@as(u16, t) << 11);
+}
+inline fn x87Phys(r: *Regs, i: u3) u3 {
+    return (x87Top(r) +% i) & 7;
+}
+inline fn x87Get(r: *Regs, i: u3) f80 {
+    const p = r.x87[x87Phys(r, i)];
+    const u: u80 = (@as(u80, p[1] & 0xffff) << 64) | p[0];
+    return @bitCast(u);
+}
+inline fn x87Set(r: *Regs, i: u3, v: f80) void {
+    const u: u80 = @bitCast(v);
+    const p = &r.x87[x87Phys(r, i)];
+    p[0] = @truncate(u);
+    p[1] = @as(u64, @truncate(u >> 64)) & 0xffff;
+}
+fn x87Push(s: St, v: f80) void {
+    x87SetTop(s.r, (x87Top(s.r) -% 1) & 7);
+    x87Set(s.r, 0, v);
+}
+inline fn x87Pop(r: *Regs) void {
+    x87SetTop(r, (x87Top(r) +% 1) & 7);
+}
+
+fn x87LoadMem(s: St, ins: *const Insn) Error!f80 {
+    return switch (ins.aux) {
+        3 => switch (ins.opsz) {
+            4 => @floatCast(@as(f32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg)))))),
+            8 => @floatCast(@as(f64, @bitCast(try common.readMem(s, ins.ea, 8, ins.pfx.seg)))),
+            else => unreachable,
+        },
+        4 => blk: {
+            const iv: i64 = switch (ins.opsz) {
+                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg))))),
+                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg))))),
+                else => unreachable,
+            };
+            break :blk @floatFromInt(iv);
+        },
+        5 => blk: {
+            const iv: i64 = switch (ins.opsz) {
+                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg))))),
+                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg))))),
+                8 => @bitCast(try common.readMem(s, ins.ea, 8, ins.pfx.seg)),
+                else => unreachable,
+            };
+            break :blk @floatFromInt(iv);
+        },
+        7 => blk: {
+            const lo = try common.readMem(s, ins.ea, 8, ins.pfx.seg);
+            const hi = try common.readMem(s, ins.ea + 8, 2, ins.pfx.seg);
+            break :blk @bitCast((@as(u80, @truncate(hi)) << 64) | lo);
+        },
+        else => unreachable,
+    };
+}
+
+fn x87StoreMem(s: St, ins: *const Insn, v: f80) Error!void {
+    switch (ins.aux) {
+        3 => switch (ins.opsz) {
+            4 => try common.writeMem(s, ins.ea, 4, ins.pfx.seg, @as(u32, @bitCast(@as(f32, @floatCast(v))))),
+            8 => try common.writeMem(s, ins.ea, 8, ins.pfx.seg, @bitCast(@as(f64, @floatCast(v)))),
+            else => unreachable,
+        },
+        5 => {
+            const iv: i64 = @intFromFloat(x87Round(s.r, v));
+            switch (ins.opsz) {
+                2 => try common.writeMem(s, ins.ea, 2, ins.pfx.seg, @as(u16, @truncate(@as(u64, @bitCast(@as(i64, @as(i16, @truncate(iv)))))))),
+                4 => try common.writeMem(s, ins.ea, 4, ins.pfx.seg, @as(u32, @truncate(@as(u64, @bitCast(@as(i64, @as(i32, @truncate(iv)))))))),
+                8 => try common.writeMem(s, ins.ea, 8, ins.pfx.seg, @bitCast(iv)),
+                else => unreachable,
+            }
+        },
+        7 => {
+            const u: u80 = @bitCast(v);
+            try common.writeMem(s, ins.ea, 8, ins.pfx.seg, @truncate(u));
+            try common.writeMem(s, ins.ea + 8, 2, ins.pfx.seg, @truncate(u >> 64));
+        },
+        else => unreachable,
+    }
+}
+
+fn x87Round(r: *Regs, v: f80) f80 {
+    return switch ((r.fcw >> 10) & 3) {
+        0 => @round(v), // nearest (ties away; x87 uses ties to even)
+        1 => @floor(v),
+        2 => @ceil(v),
+        else => @trunc(v),
+    };
+}
+
+fn x87SetCC(r: *Regs, c0: bool, c1: bool, c2: bool, c3: bool) void {
+    r.fsw = (r.fsw & ~@as(u16, (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14))) |
+        (if (c0) @as(u16, 1 << 8) else 0) | (if (c1) @as(u16, 1 << 9) else 0) |
+        (if (c2) @as(u16, 1 << 10) else 0) | (if (c3) @as(u16, 1 << 14) else 0);
+}
+
+fn x87Compare(r: *Regs, a: f80, b: f80) void {
+    if (std.math.isNan(a) or std.math.isNan(b)) {
+        x87SetCC(r, true, false, true, true);
+    } else if (a > b) {
+        x87SetCC(r, false, false, false, false);
+    } else if (a < b) {
+        x87SetCC(r, true, false, false, false);
+    } else {
+        x87SetCC(r, false, false, false, true);
+    }
+}
+
+fn x87CompareFlags(r: *Regs, a: f80, b: f80) void {
+    x87Compare(r, a, b);
+    var f = r.eflags & ~(state.CF | state.PF | state.ZF | state.OF | state.SF | state.AF);
+    if (std.math.isNan(a) or std.math.isNan(b)) {
+        f |= state.CF | state.PF | state.ZF;
+    } else if (a < b) {
+        f |= state.CF;
+    } else if (a == b) {
+        f |= state.ZF;
+    }
+    r.eflags = f;
+}
+
+fn x87Exam(r: *Regs, v: f80) void {
+    const u: u80 = @bitCast(v);
+    const sign = (u >> 79) & 1 != 0;
+    const exp: u16 = @truncate(u >> 64);
+    const frac = u & ((@as(u80, 1) << 63) - 1);
+    var c0 = false;
+    var c2 = false;
+    var c3 = false;
+    if (exp == 0 and frac == 0) {
+        c3 = true; // +0/-0
+    } else if (exp == 0) {
+        c3 = true; // denormal
+        c2 = true;
+    } else if (exp == 0x7fff) {
+        if (frac == 0) {
+            c0 = true;
+            c2 = true; // infinity
+        } else {
+            c0 = true; // NaN
+        }
+    } else {
+        c2 = true; // normal
+    }
+    x87SetCC(r, c0, sign, c2, c3);
 }

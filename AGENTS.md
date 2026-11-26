@@ -9,12 +9,13 @@ decoded-op tier and a wasm JIT) on an ISA-neutral MMU, block cache and JIT
 core (src/emu).
 
 The guest ISA is selected at build time (`-Dkw-user-isa=aarch64` by default;
-x86-64 is being brought up in `src/x86_64`, HANDOFF.md). `include/kw_emu.h`
-selects the matching `struct kw_regs` layout with `KW_USER_ISA_X86_64`; the
-kernel side of the x86-64 ABI is not in the kernel tree yet. The x86-64
+x86-64 is in `src/x86_64`, HANDOFF.md). `include/kw_emu.h` selects the
+matching `struct kw_regs` layout with `KW_USER_ISA_X86_64`; the kernel side
+of the x86-64 ABI is `kernel/patches/linux/0056-wasm-run-x86-64-user-space.patch`. The x86-64
 reference interpreter has its own native harness and tests
 (`zig build test-x86-64`, `test/x86-64-test.mjs`), and its wasm64 object
-imports nothing, like the A64 one. Its contract with the kernel is `include/kw_emu.h` (ABI 3).
+imports only `__stack_pointer`, like the A64 one. Its contract with the kernel
+is `include/kw_emu.h` (ABI 5).
 The kernel bundle (`unkernel.wasm`) carries a small base initramfs that
 boots a distro image (Alpine or Debian, read-only erofs, attached as a disk)
 under an overlay root, or the base shell without one. README.md is the overview,

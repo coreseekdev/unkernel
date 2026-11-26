@@ -23,4 +23,12 @@ else
 	base_out="$build/initramfs"
 	base_bundle="$build/bundle/unkernel.wasm"
 fi
-cc_guest=("$zig" cc -target aarch64-linux-musl -mcpu=generic -static -O2 -s "-ffile-prefix-map=$root/=")
+# The guest ISA is KW_USER_ISA (the kernel build's switch): aarch64 is the
+# default and x86_64 selects the same tools and static libc for x86-64.
+guest_isa="${KW_USER_ISA:-aarch64}"
+case "$guest_isa" in
+	aarch64 | x86_64) ;;
+	*) echo "KW_USER_ISA must be aarch64 or x86_64" >&2; exit 2 ;;
+esac
+if [ "$guest_isa" = x86_64 ]; then guest_cpu=x86_64; else guest_cpu=generic; fi
+cc_guest=("$zig" cc -target "$guest_isa-linux-musl" -mcpu="$guest_cpu" -static -O2 -s "-ffile-prefix-map=$root/=")

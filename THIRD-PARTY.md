@@ -22,6 +22,16 @@ built, is at <https://github.com/pithings/unkernel>.
   initramfs. Its source is at <https://busybox.net> and in Alpine's
   [aports](https://gitlab.alpinelinux.org/alpine/aports/-/tree/master/main/busybox).
 
+## The x86-64 CPU object (`lib/x86_64/kwemu.o`)
+
+- **Zig compiler-rt** (the x87 `f80` builtins: `addxf3`, `extenddfxf2`,
+  `truncxfdf2`, `fixxfdi`, `floatdixf`, `cmpxf2`, `sqrtx`, `roundx`,
+  `fmodx`, and their small helpers), MIT: Copyright (c) Zig contributors,
+  vendored in [`src/x86_64/x87rt`](src/x86_64/x87rt) from Zig 0.16.0
+  (<https://github.com/ziglang/zig>). The kernel's wasm64 runtime has no
+  f80 builtins, so the object defines them itself. Each file carries
+  `SPDX-License-Identifier: MIT`; the MIT notice below applies.
+
 ## The guest GL renderer (`virgl.mjs`, `virgl.wasm`)
 
 [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer) 1.3.0

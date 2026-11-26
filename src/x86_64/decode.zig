@@ -111,6 +111,10 @@ pub const Op = enum(u8) {
     mfence,
     lfence,
     sfence,
+    fxsave,
+    fxrstor,
+    xsave,
+    xrstor,
     pause,
     xlat,
     movnti,
@@ -302,12 +306,29 @@ pub const Fpu = enum(u8) {
     fsub,
     fmul,
     fdiv,
+    fsubr,
+    fdivr,
+    fiadd,
+    fisub,
+    fimul,
+    fidiv,
+    fisubr,
+    fidivr,
     faddp,
     fmulp,
     fsubp,
     fsubrp,
     fdivp,
     fdivrp,
+    fcom,
+    fcomp,
+    fcompp,
+    fucom,
+    fucomp,
+    fucomi,
+    fucomip,
+    fcomi,
+    fcomip,
     fldcw,
     fnstcw,
     fnstsw,
@@ -317,6 +338,17 @@ pub const Fpu = enum(u8) {
     fsqrt,
     fxch,
     ftst,
+    fxam,
+    fld1,
+    fldz,
+    fldpi,
+    fldl2e,
+    fldl2t,
+    fldln2,
+    fldlg2,
+    frndint,
+    fscale,
+    fprem,
     fucompp,
 };
 
@@ -977,8 +1009,14 @@ fn twoByte(d: *Dec) common.DecodeError!void {
                     else => return common.invalid(d.s, d.raw),
                 };
             } else if (ins.opx == 7) {
-                ins.op = .nop;
-            } else return common.invalid(d.s, d.raw);
+                ins.op = .nop; // clflush
+            } else ins.op = switch (ins.opx) {
+                0 => .fxsave,
+                1 => .fxrstor,
+                4 => .xsave,
+                5 => .xrstor,
+                else => return common.invalid(d.s, d.raw),
+            };
         },
         0xaf => {
             try d.modrm();
@@ -1313,7 +1351,29 @@ fn fpuOp(d: *Dec, op: u8) common.DecodeError!void {
     ins.op = .fpu;
     try d.modrm();
     const m = ins.md != 3;
+    // Memory operand classes and register-form direction live in ins.aux:
+    // 0 = st(0) = st(0) op st(i), 1 = st(i) = st(i) op st(0),
+    // 2 = the pop forms (DE C0..), 3.. = memory operand classes.
     switch (op) {
+        0xd8 => {
+            const float: Fpu = switch (ins.opx) {
+                0 => .fadd,
+                1 => .fmul,
+                2 => .fcom,
+                3 => .fcomp,
+                4 => .fsub,
+                5 => .fsubr,
+                6 => .fdiv,
+                7 => .fdivr,
+            };
+            ins.fpu = float;
+            if (m) {
+                ins.opsz = 4;
+                ins.aux = 3; // m32fp
+            } else {
+                ins.aux = 0;
+            }
+        },
         0xd9 => {
             if (m) {
                 ins.fpu = switch (ins.opx) {
@@ -1324,27 +1384,108 @@ fn fpuOp(d: *Dec, op: u8) common.DecodeError!void {
                     7 => .fnstcw,
                     else => return common.invalid(d.s, d.raw),
                 };
+                ins.opsz = if (ins.opx == 0 or ins.opx == 2 or ins.opx == 3) 4 else 2;
+                ins.aux = if (ins.opx == 0 or ins.opx == 2 or ins.opx == 3) 3 else 6;
             } else {
+                ins.aux = 0;
+                if (ins.opx == 0) {
+                    ins.fpu = .fld;
+                } else if (ins.opx == 1) {
+                    ins.fpu = .fxch;
+                } else if (ins.opx == 4) {
+                    ins.fpu = switch (ins.rm) {
+                        0 => .fchs,
+                        1 => .fabs,
+                        4 => .ftst,
+                        5 => .fxam,
+                        else => return common.invalid(d.s, d.raw),
+                    };
+                } else if (ins.opx == 5) {
+                    ins.fpu = switch (ins.rm) {
+                        0 => .fld1,
+                        1 => .fldl2t,
+                        2 => .fldl2e,
+                        3 => .fldpi,
+                        4 => .fldlg2,
+                        5 => .fldln2,
+                        6 => .fldz,
+                        else => return common.invalid(d.s, d.raw),
+                    };
+                } else if (ins.opx == 7) {
+                    ins.fpu = switch (ins.rm) {
+                        2 => .fsqrt,
+                        4 => .frndint,
+                        5 => .fscale,
+                        0 => .fprem,
+                        else => return common.invalid(d.s, d.raw),
+                    };
+                } else return common.invalid(d.s, d.raw);
+            }
+        },
+        0xda => {
+            if (m) {
                 ins.fpu = switch (ins.opx) {
-                    0 => .fld,
-                    1 => .fxch,
-                    4 => .fchs,
-                    5 => .fabs,
-                    6 => .ftst,
+                    0 => .fiadd,
+                    1 => .fimul,
+                    2 => .fcom,
+                    3 => .fcomp,
+                    4 => .fisub,
+                    5 => .fisubr,
+                    6 => .fidiv,
+                    7 => .fidivr,
+                };
+                ins.opsz = 4;
+                ins.aux = 4; // m32int
+            } else return common.invalid(d.s, d.raw);
+        },
+        0xdb => {
+            if (m) {
+                ins.fpu = switch (ins.opx) {
+                    0 => .fild,
+                    2 => .fist,
+                    3 => .fistp,
+                    5 => .fld,
+                    7 => .fstp,
+                    else => return common.invalid(d.s, d.raw),
+                };
+                ins.opsz = if (ins.opx == 5 or ins.opx == 7) 10 else 4;
+                ins.aux = if (ins.opx == 5 or ins.opx == 7) 7 else 5; // m80fp / m32int
+            } else {
+                ins.aux = 0;
+                ins.fpu = switch (ins.opx) {
+                    5 => .fucomi,
+                    6 => .fcomi,
                     else => return common.invalid(d.s, d.raw),
                 };
             }
         },
-        0xdb => {
-            if (!m) return common.invalid(d.s, d.raw);
-            ins.fpu = switch (ins.opx) {
-                0 => .fild,
-                2 => .fist,
-                3 => .fistp,
-                5 => .fld,
-                7 => .fstp,
-                else => return common.invalid(d.s, d.raw),
-            };
+        0xdc => {
+            if (m) {
+                ins.fpu = switch (ins.opx) {
+                    0 => .fadd,
+                    1 => .fmul,
+                    2 => .fcom,
+                    3 => .fcomp,
+                    4 => .fsub,
+                    5 => .fsubr,
+                    6 => .fdiv,
+                    7 => .fdivr,
+                };
+                ins.opsz = 8;
+                ins.aux = 3; // m64fp
+            } else {
+                ins.aux = 1;
+                ins.fpu = switch (ins.opx) {
+                    0 => .fadd,
+                    1 => .fmul,
+                    2 => .fcom,
+                    3 => .fcomp,
+                    4 => .fsub,
+                    5 => .fsubr,
+                    6 => .fdiv,
+                    7 => .fdivr,
+                };
+            }
         },
         0xdd => {
             if (m) {
@@ -1355,66 +1496,72 @@ fn fpuOp(d: *Dec, op: u8) common.DecodeError!void {
                     7 => .fnstsw,
                     else => return common.invalid(d.s, d.raw),
                 };
+                ins.opsz = if (ins.opx == 7) 2 else 8;
+                ins.aux = if (ins.opx == 7) 6 else 3;
             } else {
+                ins.aux = 0;
                 ins.fpu = switch (ins.opx) {
                     0 => .fld,
                     2 => .fst,
                     3 => .fstp,
-                    else => return common.invalid(d.s, d.raw),
-                };
-            }
-        },
-        0xdf => {
-            if (m) {
-                ins.fpu = switch (ins.opx) {
-                    5 => .fild,
-                    7 => .fistp,
-                    else => return common.invalid(d.s, d.raw),
-                };
-            } else {
-                ins.fpu = switch (ins.opx) {
-                    4 => .fnstsw,
-                    5 => .fucompp,
-                    6 => .fninit,
+                    4 => .fucom,
+                    5 => .fucomp,
                     else => return common.invalid(d.s, d.raw),
                 };
             }
         },
         0xde => {
-            if (m) return common.invalid(d.s, d.raw);
-            ins.fpu = switch (ins.opx) {
-                1 => .faddp,
-                3 => .fsubp,
-                4 => .fsubrp,
-                5 => .fmulp,
-                6 => .fdivp,
-                7 => .fdivrp,
-                else => return common.invalid(d.s, d.raw),
-            };
+            if (m) {
+                ins.fpu = switch (ins.opx) {
+                    0 => .fiadd,
+                    1 => .fimul,
+                    2 => .fcom,
+                    3 => .fcomp,
+                    4 => .fisub,
+                    5 => .fisubr,
+                    6 => .fidiv,
+                    7 => .fidivr,
+                };
+                ins.opsz = 2;
+                ins.aux = 4; // m16int
+            } else {
+                ins.aux = 2;
+                if (ins.opx == 3 and ins.rm == 1) {
+                    ins.fpu = .fcompp;
+                } else {
+                    ins.fpu = switch (ins.opx) {
+                        0 => .faddp,
+                        1 => .fmulp,
+                        4 => .fsubrp,
+                        5 => .fsubp,
+                        6 => .fdivrp,
+                        7 => .fdivp,
+                        else => return common.invalid(d.s, d.raw),
+                    };
+                }
+            }
         },
-        0xda => {
-            if (!m) return common.invalid(d.s, d.raw);
-            ins.fpu = switch (ins.opx) {
-                0 => .fadd,
-                1 => .fmul,
-                4 => .fsub,
-                5 => .fsubrp,
-                6 => .fdiv,
-                7 => .fdivrp,
-                else => return common.invalid(d.s, d.raw),
-            };
-        },
-        0xdc => {
-            if (!m) return common.invalid(d.s, d.raw);
-            ins.fpu = switch (ins.opx) {
-                0 => .fadd,
-                1 => .fmul,
-                4 => .fsub,
-                5 => .fsubrp,
-                6 => .fdiv,
-                7 => .fdivrp,
-                else => return common.invalid(d.s, d.raw),
-            };
+        0xdf => {
+            if (m) {
+                ins.fpu = switch (ins.opx) {
+                    0 => .fild,
+                    2 => .fist,
+                    3 => .fistp,
+                    5 => .fild,
+                    7 => .fistp,
+                    else => return common.invalid(d.s, d.raw),
+                };
+                ins.opsz = if (ins.opx == 5 or ins.opx == 7) 8 else 2;
+                ins.aux = 5; // integer
+            } else {
+                ins.aux = 0;
+                ins.fpu = switch (ins.opx) {
+                    4 => .fnstsw,
+                    5 => .fucomip,
+                    6 => .fcomip,
+                    else => return common.invalid(d.s, d.raw),
+                };
+            }
         },
         else => return common.invalid(d.s, d.raw),
     }

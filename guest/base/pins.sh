@@ -5,5 +5,10 @@
 # Alpine release, independent of the Alpine distro image's.
 BUSYBOX_ALPINE=3.24
 BUSYBOX_STATIC_APK="busybox-static-1.37.0-r31.apk"
-BUSYBOX_STATIC_URL="https://dl-cdn.alpinelinux.org/alpine/v$BUSYBOX_ALPINE/main/aarch64/$BUSYBOX_STATIC_APK"
-BUSYBOX_STATIC_SHA256=965777e06b94bf11981d5f4ecdfcd577879f4b0dda544294d1dd3f72b217bc75
+if [ "${KW_USER_ISA:-aarch64}" = x86_64 ]; then
+	BUSYBOX_STATIC_URL="https://dl-cdn.alpinelinux.org/alpine/v$BUSYBOX_ALPINE/main/x86_64/$BUSYBOX_STATIC_APK"
+	BUSYBOX_STATIC_SHA256=b0d6cfc585d7fdd12df359cc5d38d5e45894e9e9e78c4059eb41577d022ec734
+else
+	BUSYBOX_STATIC_URL="https://dl-cdn.alpinelinux.org/alpine/v$BUSYBOX_ALPINE/main/aarch64/$BUSYBOX_STATIC_APK"
+	BUSYBOX_STATIC_SHA256=965777e06b94bf11981d5f4ecdfcd577879f4b0dda544294d1dd3f72b217bc75
+fi

@@ -50,6 +50,16 @@ pub const Regs = extern struct {
     /// 64-bit halves so no 128-bit shift or multiplication is ever needed
     /// (those become compiler-rt calls the kernel does not link).
     xmm: [16][2]u64 align(16) = @splat(.{ 0, 0 }),
+    /// x87 ST(0)..ST(7), physical order (the stack top is fsw bits 11..13).
+    /// Each is the little-endian 80-bit x87 value in the low 10 bytes of
+    /// the 16-byte slot (the kernel treats them as opaque bytes).
+    x87: [8][2]u64 align(16) = @splat(.{ 0, 0 }),
+    fcw: u16 = 0x037f,
+    fsw: u16 = 0,
+    ftw: u16 = 0,
+    fop: u16 = 0,
+    fip: u64 = 0,
+    fdp: u64 = 0,
 };
 
 /// The x86-64 part of kwemu's private area in struct kw_cpu. Everything

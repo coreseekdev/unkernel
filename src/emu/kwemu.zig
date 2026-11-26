@@ -22,7 +22,7 @@ const std = @import("std");
 const core = @import("../cpu/core.zig");
 const c = @import("kw_h"); // include/kw_emu.h via translate-c
 
-pub const abi_version: u32 = 4;
+pub const abi_version: u32 = 5;
 pub const cpu_size: usize = 9 << 20;
 
 pub const Event = extern struct {
@@ -915,7 +915,6 @@ pub const Cpu = extern struct {
         comptime std.debug.assert(@sizeOf(T) == @sizeOf(Slot) and @alignOf(T) <= @alignOf(Slot));
         return @ptrCast(&self.priv.ops);
     }
-
 };
 
 comptime {

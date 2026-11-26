@@ -157,8 +157,12 @@ mkdir -p "$tstage/usr/bin"
 for t in kwtest kwbench; do
 	"${cc_guest[@]}" -o "$tstage/usr/bin/$t" "$guest/src/test/$t.c"
 done
-"$zig" cc -target aarch64-linux-none -mcpu=generic -nostdlib -ffreestanding -static -O2 \
-	-fno-stack-protector -s "-ffile-prefix-map=$root/=" -o "$tstage/usr/bin/abitest" "$guest/src/test/abitest.c"
+# abitest is the AArch64 ABI test (its asm names x8..x30); the x86-64
+# counterpart is the x86 unit/guest suite for now.
+if [ "$guest_isa" = aarch64 ]; then
+	"$zig" cc -target aarch64-linux-none -mcpu=generic -nostdlib -ffreestanding -static -O2 \
+		-fno-stack-protector -s "-ffile-prefix-map=$root/=" -o "$tstage/usr/bin/abitest" "$guest/src/test/abitest.c"
+fi
 
 nodes=(--node dev/console:c:5:1:600 --node dev/null:c:1:3:666)
 python3 "$guest/tools/mkcpio.py" "$stage" "$out/base-image.cpio" "${nodes[@]}"

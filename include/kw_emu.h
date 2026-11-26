@@ -82,7 +82,7 @@
 extern "C" {
 #endif
 
-#define KW_ABI_VERSION 4
+#define KW_ABI_VERSION 5
 
 /*
  * The register state of one task depends on the guest ISA the emulator was
@@ -133,6 +133,12 @@ struct kw_regs {
 	uint32_t mxcsr;    /* MXCSR as LDMXCSR/STMXCSR see it */
 	uint32_t _pad;
 	uint64_t xmm[16][2] __attribute__((aligned(16)));
+	/* x87 ST(0)..ST(7) in physical order (fsw bits 11..13 hold TOP); the
+	 * 80-bit value is the low 10 bytes of each slot. Then the control,
+	 * status and tag words. */
+	uint64_t x87[8][2] __attribute__((aligned(16)));
+	uint16_t fcw, fsw, ftw, fop;
+	uint64_t fip, fdp;
 } __attribute__((aligned(16)));
 #endif
 

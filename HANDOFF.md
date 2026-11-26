@@ -2,10 +2,9 @@
 <!-- Copyright (C) 2026 Pooya Parsa <pooya@pi0.io> -->
 # Handoff: x86-64 browser support and RISC-V revival
 
-Date: 2026-11-26
-Status: phase 0 and the phase 1 reference interpreter are implemented and
-tested; phases 2-5 are the next rounds. See "Current state" below before
-starting.
+Date: 2026-11-27
+Status: phases 0 and 1 are done; phase 2 boots Alpine and a Debian 13
+amd64 userspace. See "Current state" below before starting.
 
 ## Current state (2026-11-27)
 
@@ -24,10 +23,14 @@ Done in this tree:
   variable-length decode (REX, ModRM/SIB, address/operand sizes, RIP
   relative), the integer baseline, string instructions, atomics
   (XCHG/XADD/CMPXCHG/8B/16B), bits/shifts, precise faults, SYSCALL,
-  CPUID, RDTSC/RDTSCP, CLFLUSH/MOVNTI as their effects, and SSE2 packed,
-  scalar, conversion and comparison operations. XMM state is two 64-bit
-  halves, so the wasm64 object imports no functions at all (the A64 test's
-  rule: no `__multi3`, `__lshrti3`, `fmin` or `memcpy`).
+  CPUID, RDTSC/RDTSCP, CLFLUSH/MOVNTI as their effects, SSE2 packed,
+  scalar, conversion and comparison operations, and x87: the eight-register
+  stack with exact 80-bit values (Zig's compiler_rt f80 helpers are
+  vendored in `src/x86_64/x87rt` because the kernel's wasm64 runtime does
+  not provide them), the control/status/tag words, loads/stores,
+  arithmetic, comparisons, conversions, `fxam`/`fnstsw`, and
+  `FXSAVE`/`FXRSTOR`. The wasm64 object still imports only
+  `__stack_pointer`; XMM state is two 64-bit halves.
 - **Phase 1 tests.** `src/x86_64/tests.zig` (native unit tests: flags,
   addressing, stack, faults, SSE), a mini-kernel harness
   (`src/x86_64/harness.zig`: Sv48 page tables with A/D demand faults, ELF
@@ -44,11 +47,14 @@ Done in this tree:
   kernel/build.sh kernel` builds it into `vendor/build/kernel-x86_64/`
   (the AArch64 outputs are untouched; the fresh-tree path applies 0056 to
   the vendor tree). A static x86-64 init, the static Debian BusyBox
-  rootfs (fork/exec/wait, applets, `ls`, `poweroff`) and the Alpine
-  3.20.3 minirootfs (dynamic `ld-musl` and BusyBox: `mount`, `uname`,
-  `ls`, `cat`, `grep`, `sed`, `md5sum`/`sha256sum`, `ps`, `/proc`, power
-  off) run through the real kernel on both `vmlinux` and
-  `vmlinux32.wasm`.
+  rootfs (fork/exec/wait, applets, `ls`, `poweroff`), the Alpine 3.20.3
+  minirootfs (dynamic `ld-musl` and BusyBox: `mount`, `uname`, `ls`,
+  `cat`, `grep`, `sed`, `md5sum`/`sha256sum`, `ps`, `/proc`, power off)
+  and Debian 13 amd64 userspace (glibc `bash`/`dash`, `ls`, `dpkg`,
+  `apt-cache --version`, `fxsave`) run through the real kernel on both
+  `vmlinux` and `vmlinux32.wasm`. The guest build selects x86-64 with
+  `KW_USER_ISA=x86_64` (static BusyBox pin, `cc_guest`, and Debian's
+  amd64 rootfs/lists in `pins-x86_64.sh`).
 - **Emulator bugs found by real user space** (each now has a native unit
   test): `PSLLDQ`/`PSRLDQ` must name ModRM.rm (the code wrote the
   extension register, breaking glibc's aligned `__strcmp_sse2` and
@@ -59,26 +65,32 @@ Done in this tree:
   computed in 64 bits (`0 -% sz` with `sz: u8` wrapped to `0xff`, so
   every backward `rep movsb`/`stos`/`cmps` moved by 255). The earlier
   immediate packed-shift clobber (ModRM.reg overwritten) is also fixed.
+  Real Debian user space also exposed `fistp` ignoring the x87 control
+  word's truncation mode (musl's `strtold` sets it) and the missing
+  `FXSAVE`/`FXRSTOR`; both are implemented now.
 - **Kernel fixes in 0056:** `rt_sigreturn` reads the frame at `rsp - 8`
   because the return through `sa_restorer` has already popped
   `pretcode`; `CONFIG_WASM_USER_X86_64` selects x86-64's `struct stat`
   (`arch/wasm/include/asm/stat.h`) and the asm-generic `O_*` bits
   (`arch/wasm/include/uapi/asm/fcntl.h`), which fixed `stat`/`ls`/PATH
   lookup and `open(O_DIRECTORY)`.
-- **Remaining phase 2 work:** x87 is still a precise #UD, so Alpine's
-  `seq` and `awk` (musl's long-double path: `fildl`, `fldt`, `fstpt`,
-  `fmulp`) trap SIGILL; `df` reports "can't find mount point" although
-  `stat`/`statfs` values look sane, so the mount-table match is the next
-  lead; x86-64 ptrace regsets and core-dump notes are not implemented
-  (`HAVE_ARCH_TRACEHOOK` stays off for x86); AVX/SSSE3/SSE4 are not
-  advertised; the decoded-op tier and wasm JIT are phase 4; riscv64 is
-  phase 3.
+- **Remaining phase 2 work:** Debian's `apt` cannot yet build its package
+  cache: `apt-cache policy` and `apt-get install` reach `memcmp` with a
+  key length of `-1` in a `libapt-pkg` hash lookup, even with the lists
+  removed or an empty dpkg status. The list files and their lz4
+  decompression match the host, so the next lead is the remaining libc
+  string/memory calls (`strchrnul`, `strcasecmp`, `memrchr`, `memmem`) or
+  the cache generator's string handling. `df` still reports "can't find
+  mount point"; x86-64 ptrace regsets and core-dump notes are not
+  implemented (`HAVE_ARCH_TRACEHOOK` stays off for x86); AVX/SSSE3/SSE4
+  are not advertised (Debian's baseline glibc paths are used); the
+  decoded-op tier and wasm JIT are phase 4; riscv64 is phase 3.
 
-The next round implements x87 (the stack plus long double loads/stores,
-arithmetic, comparisons, conversions and `fxam`/`fnstsw`/control words),
-then the `df` mount-point match, then threads/futex/signal conformance
-with kwtest/abitest. Keep the reference interpreter as the oracle for
-the decoded-op tier and reuse the guest corpus.
+The next round fixes the apt/libapt-pkg cache path, then brings up the
+Debian package install and Firefox (headless first), then
+threads/futex/signal conformance with kwtest/abitest. Keep the reference
+interpreter as the oracle for the decoded-op tier and reuse the guest
+corpus.
 
 ## 1. Objective and priorities
 

@@ -73,6 +73,9 @@ set -euo pipefail
 . "$guest/lib/stage.sh"                # distro_unpack, install_tree, install_common
 . "$guest/lib/image.sh"                # distro_images, distro_out
 . "$guest/distro/debian/pins.sh"       # DEBIAN_*, WLANDR_*
+if [ "${KW_USER_ISA:-aarch64}" = x86_64 ]; then
+	. "$guest/distro/debian/pins-x86_64.sh"   # the amd64 tarball and lists
+fi
 umask 022
 here="$guest/distro/debian"
 
@@ -183,7 +186,7 @@ while read -r path sum; do
 	contents+=("$file")
 done <<< "$DEBIAN_CONTENTS"
 python3 -I "$here/tools/commands.py" \
-	<(xz -dc "$dl/debian-lists/$DEBIAN_LISTS_SNAPSHOT/debian/trixie/main/binary-arm64/Packages.xz") \
+	<(xz -dc "$dl/debian-lists/$DEBIAN_LISTS_SNAPSHOT/debian/trixie/main/binary-${DEBIAN_ARCH:-arm64}/Packages.xz") \
 	"${contents[@]}" > "$stage/usr/lib/kw-commands"
 grep -qx 'rg ripgrep' "$stage/usr/lib/kw-commands" ||
 	{ echo "debian: /usr/lib/kw-commands has no rg -> ripgrep" >&2; exit 1; }
@@ -210,11 +213,13 @@ if [ -n "${KW_WLANDR:-}" ]; then
 	[ -f "$KW_WLANDR" ] || { echo "KW_WLANDR=$KW_WLANDR: no such file" >&2; exit 1; }
 	echo "debian: wlandr from KW_WLANDR=$KW_WLANDR (not the pinned $WLANDR_VERSION)" >&2
 	cp "$KW_WLANDR" "$stage/usr/lib/kw/wlandr"
-else
+elif [ -n "${WLANDR_URL:-}" ]; then
 	fetch_verified "$WLANDR_URL" "$dl/$WLANDR_TARBALL" "$WLANDR_SHA256"
 	tar -xzf "$dl/$WLANDR_TARBALL" -O wlandr > "$stage/usr/lib/kw/wlandr"
+else
+	echo "debian: no wlandr for this guest ISA (no Wayland relay in the image)" >&2
 fi
-chmod 755 "$stage/usr/lib/kw/wlandr"
+[ ! -f "$stage/usr/lib/kw/wlandr" ] || chmod 755 "$stage/usr/lib/kw/wlandr"
 
 # --- in the image: apt's source cache, the baked packages ----------------------------
 # The packages the image comes with, on top of the tarball's (with their

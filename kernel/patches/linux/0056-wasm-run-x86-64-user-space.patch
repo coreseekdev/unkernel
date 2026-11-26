@@ -1,4 +1,4 @@
-From 1a842099e547dd2974ef731588e851a83def4f1f Mon Sep 17 00:00:00 2001
+From bd6f852cc68e098d182fe08b70dbdccb38aef637 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Thu, 26 Nov 2026 22:33:16 +0800
 Subject: [PATCH] wasm: run x86-64 user space
@@ -30,7 +30,7 @@ and powers the kernel off.
  arch/wasm/Makefile                      |  12 +-
  arch/wasm/configs/kw_x86.config         |   3 +
  arch/wasm/include/asm/elf.h             |  29 ++-
- arch/wasm/include/asm/kw_emu.h          |  75 ++++--
+ arch/wasm/include/asm/kw_emu.h          |  83 +++++--
  arch/wasm/include/asm/processor.h       |  10 +
  arch/wasm/include/asm/ptrace.h          |  37 ++-
  arch/wasm/include/asm/seccomp.h         |  11 +-
@@ -42,16 +42,16 @@ and powers the kernel off.
  arch/wasm/include/uapi/asm/prctl.h      |  14 ++
  arch/wasm/kernel/Makefile.syscalls      |  11 +-
  arch/wasm/kernel/cpu.c                  |  35 +++
- arch/wasm/kernel/process.c              |  35 ++-
+ arch/wasm/kernel/process.c              |  37 ++-
  arch/wasm/kernel/prof.c                 |   8 +-
  arch/wasm/kernel/ptrace.c               |  31 +++
- arch/wasm/kernel/signal.c               | 305 ++++++++++++++++++++++++
+ arch/wasm/kernel/signal.c               | 317 ++++++++++++++++++++++++
  arch/wasm/kernel/sys.c                  |  56 +++++
  arch/wasm/kernel/syscall_table.c        |   9 +-
  arch/wasm/kernel/traps.c                |  44 +++-
  arch/wasm/mm/fault.c                    |   6 +-
  arch/wasm/mm/sigpage.c                  |   7 +
- 25 files changed, 857 insertions(+), 52 deletions(-)
+ 25 files changed, 878 insertions(+), 53 deletions(-)
  create mode 100644 arch/wasm/configs/kw_x86.config
  create mode 100644 arch/wasm/include/asm/stat.h
  create mode 100644 arch/wasm/include/uapi/asm/prctl.h
@@ -213,7 +213,7 @@ index fc3631e5a..afb978c5c 100644
  #define SET_PERSONALITY(ex) \
  	set_personality(PER_LINUX | (current->personality & (~PER_MASK)))
 diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
-index 7db679113..455f76335 100644
+index 7db679113..5fa10fe0a 100644
 --- a/arch/wasm/include/asm/kw_emu.h
 +++ b/arch/wasm/include/asm/kw_emu.h
 @@ -7,13 +7,15 @@
@@ -239,9 +239,12 @@ index 7db679113..455f76335 100644
   *
   * Memory model: kernel and emulator share one wasm64 linear memory. A
   * "physical address" is a linear-memory address minus cpu->phys_base.
-@@ -82,6 +84,14 @@ extern "C" {
+@@ -80,8 +82,16 @@
+ extern "C" {
+ #endif
  
- #define KW_ABI_VERSION 4
+-#define KW_ABI_VERSION 4
++#define KW_ABI_VERSION 5
  
 +/*
 + * The register state of one task depends on the guest ISA the emulator was
@@ -254,7 +257,7 @@ index 7db679113..455f76335 100644
  /*
   * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
   * at 0, sp 248, pc 256, nzcv 264, fpcr 268, fpsr 272, tpidr_el0 280, and
-@@ -102,20 +112,53 @@ struct kw_regs {
+@@ -102,20 +112,59 @@ struct kw_regs {
  	uint64_t tpidr_el0;
  	uint64_t v[32][2] __attribute__((aligned(16)));
  } __attribute__((aligned(16)));
@@ -279,6 +282,12 @@ index 7db679113..455f76335 100644
 +	uint32_t mxcsr;    /* MXCSR as LDMXCSR/STMXCSR see it */
 +	uint32_t _pad;
 +	uint64_t xmm[16][2] __attribute__((aligned(16)));
++	/* x87 ST(0)..ST(7) in physical order (fsw bits 11..13 hold TOP); the
++	 * 80-bit value is the low 10 bytes of each slot. Then the control,
++	 * status and tag words. */
++	uint64_t x87[8][2] __attribute__((aligned(16)));
++	uint16_t fcw, fsw, ftw, fop;
++	uint64_t fip, fdp;
 +} __attribute__((aligned(16)));
 +#endif
  
@@ -315,7 +324,7 @@ index 7db679113..455f76335 100644
  	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
  };
  
-@@ -172,7 +215,9 @@ void kw_cpu_init(struct kw_cpu *cpu);
+@@ -172,7 +221,9 @@ void kw_cpu_init(struct kw_cpu *cpu);
   * taken branch out of a block (a branch the decoder followed
   * inside a page is not a check point). Every event leaves regs (incl. pc)
   * exactly at an instruction boundary. Data accesses may be unaligned
@@ -787,7 +796,7 @@ index ef54fc246..d3b7d158b 100644
  	return 0;
  }
 diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
-index 98b3ef59d..8785e350d 100644
+index 98b3ef59d..99607fbf4 100644
 --- a/arch/wasm/kernel/process.c
 +++ b/arch/wasm/kernel/process.c
 @@ -426,12 +426,21 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
@@ -812,7 +821,7 @@ index 98b3ef59d..8785e350d 100644
  		p->thread.fn = NULL;
  		p->thread.fn_arg = NULL;
  	}
-@@ -458,14 +467,23 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+@@ -458,14 +467,25 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
  }
  
  /*
@@ -831,6 +840,8 @@ index 98b3ef59d..8785e350d 100644
 +	regs->user.cs = 0x33;
 +	regs->user.ss = 0x2b;
 +	regs->user.mxcsr = 0x1f80;
++	regs->user.fcw = 0x037f;
++	regs->user.ftw = 0xffff;
 +#else
  	regs->user.pc = pc;
  	regs->user.sp = sp;
@@ -838,7 +849,7 @@ index 98b3ef59d..8785e350d 100644
  	regs->kernel = 0;
  }
  
-@@ -474,6 +492,18 @@ void show_regs(struct pt_regs *regs)
+@@ -474,6 +494,18 @@ void show_regs(struct pt_regs *regs)
  	int i;
  
  	show_regs_print_info(KERN_DEFAULT);
@@ -857,7 +868,7 @@ index 98b3ef59d..8785e350d 100644
  	pr_cont("pc : %016llx lr : %016llx sp : %016llx nzcv: %08x\n",
  		regs->user.pc, regs->user.x[30], regs->user.sp,
  		regs->user.nzcv);
-@@ -481,6 +511,7 @@ void show_regs(struct pt_regs *regs)
+@@ -481,6 +513,7 @@ void show_regs(struct pt_regs *regs)
  		pr_cont(" x%-2d %016llx x%-2d %016llx x%-2d %016llx\n",
  			i, regs->user.x[i], i + 1, regs->user.x[i + 1],
  			i + 2, regs->user.x[i + 2]);
@@ -946,7 +957,7 @@ index 96f8810cf..f8adc5e09 100644
 +
 +#endif
 diff --git a/arch/wasm/kernel/signal.c b/arch/wasm/kernel/signal.c
-index 040dd1c65..c0fa16921 100644
+index 040dd1c65..32a8e5043 100644
 --- a/arch/wasm/kernel/signal.c
 +++ b/arch/wasm/kernel/signal.c
 @@ -29,6 +29,8 @@
@@ -958,7 +969,7 @@ index 040dd1c65..c0fa16921 100644
  struct rt_sigframe {
  	struct siginfo info;
  	struct ucontext uc;
-@@ -322,3 +324,306 @@ static int __init init_signal_minsigstksz(void)
+@@ -322,3 +324,318 @@ static int __init init_signal_minsigstksz(void)
  	return 0;
  }
  arch_initcall(init_signal_minsigstksz);
@@ -1089,6 +1100,13 @@ index 040dd1c65..c0fa16921 100644
 +	fp = sigframe_fp(frame);
 +	if (__copy_from_user(&regs->user.mxcsr, &fp->mxcsr, sizeof(u32)))
 +		goto badframe;
++	if (__get_user(regs->user.fcw, &fp->cwd) ||
++	    __get_user(regs->user.fsw, &fp->swd) ||
++	    __get_user(regs->user.ftw, &fp->twd) ||
++	    __get_user(regs->user.fop, &fp->fop))
++		goto badframe;
++	for (i = 0; i < 8; i++)
++		err |= __copy_from_user(&regs->user.x87[i], &fp->st[i * 16], 16);
 +	for (i = 0; i < 16; i++)
 +		err |= __copy_from_user(&regs->user.xmm[i], &fp->xmm[i * 16], 16);
 +	if (err || restore_altstack(&frame->uc.uc_stack))
@@ -1143,8 +1161,13 @@ index 040dd1c65..c0fa16921 100644
 +	err |= __put_user(regs->user.gs_base, &sc->reserved1[1]);
 +	err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));
 +
-+	err |= __put_user((__u16)0x37f, &fp->cwd);
++	err |= __put_user(regs->user.fcw, &fp->cwd);
++	err |= __put_user(regs->user.fsw, &fp->swd);
++	err |= __put_user(regs->user.ftw, &fp->twd);
++	err |= __put_user(regs->user.fop, &fp->fop);
 +	err |= __put_user((__u32)regs->user.mxcsr, &fp->mxcsr);
++	for (i = 0; i < 8; i++)
++		err |= __copy_to_user(&fp->st[i * 16], &regs->user.x87[i], 16);
 +	for (i = 0; i < 16; i++)
 +		err |= __copy_to_user(&fp->xmm[i * 16], &regs->user.xmm[i], 16);
 +
