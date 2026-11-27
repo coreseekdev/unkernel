@@ -49,6 +49,25 @@ int main(void) {
     _mm_storeu_si128((__m128i *)out, shift);
     CHECK(out[0] == 16 && out[3] == 64);
 
+    /* pinsrw: imm[2:0] must select the 16-bit word (GCC's zlib ct_data
+       packing uses pinsrw $1 after movd). Volatile input keeps the
+       compiler from folding the inserts into one constant. */
+    volatile int16_t pv[8] = { 0x1111, 0x2222, 0x3333, 0x4444,
+                               0x5555, 0x6666, 0x7777, 0x8888 };
+    __m128i p = _mm_setzero_si128();
+    p = _mm_insert_epi16(p, pv[0], 0);
+    p = _mm_insert_epi16(p, pv[1], 1);
+    p = _mm_insert_epi16(p, pv[2], 2);
+    p = _mm_insert_epi16(p, pv[3], 3);
+    p = _mm_insert_epi16(p, pv[4], 4);
+    p = _mm_insert_epi16(p, pv[5], 5);
+    p = _mm_insert_epi16(p, pv[6], 6);
+    p = _mm_insert_epi16(p, pv[7], 7);
+    int16_t po[8];
+    _mm_storeu_si128((__m128i *)po, p);
+    for (int i = 0; i < 8; i++)
+        CHECK(po[i] == (int16_t)(0x1111 * (i + 1)));
+
     if (fails) { printf("sse2 failures=%d\n", fails); return 1; }
     printf("sse2 ok\n");
     return 0;

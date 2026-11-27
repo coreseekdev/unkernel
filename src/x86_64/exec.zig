@@ -1685,8 +1685,14 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
         },
         .pinsrw => {
             const src = try rmRead(s, ins, 2);
-            const i = imm & 7;
-            dst[i] = (dst[i] & ~@as(u64, 0xffff)) | (src & 0xffff);
+            // PINSRW's imm8 selects one of the eight 16-bit words; dst is
+            // two u64 halves, so the low two bits pick the word within a
+            // half. (Writing the low word of the half for every imm lost
+            // GCC's vectorized ct_data packing in zlib.)
+            const idx: u3 = @intCast(imm & 7);
+            const sh: u6 = @intCast(@as(u32, idx & 3) * 16);
+            dst[idx >> 2] = (dst[idx >> 2] & ~(@as(u64, 0xffff) << sh)) |
+                ((src & 0xffff) << sh);
         },
         .pextrw => {
             if (ins.md != 3) return common.ill(s, ins.raw);

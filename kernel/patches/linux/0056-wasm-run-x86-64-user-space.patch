@@ -1,4 +1,4 @@
-From bd6f852cc68e098d182fe08b70dbdccb38aef637 Mon Sep 17 00:00:00 2001
+From 63f8fc84b640ad5b144d96099f8ebe3aaa71c9a3 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Thu, 26 Nov 2026 22:33:16 +0800
 Subject: [PATCH] wasm: run x86-64 user space
@@ -30,28 +30,29 @@ and powers the kernel off.
  arch/wasm/Makefile                      |  12 +-
  arch/wasm/configs/kw_x86.config         |   3 +
  arch/wasm/include/asm/elf.h             |  29 ++-
- arch/wasm/include/asm/kw_emu.h          |  83 +++++--
+ arch/wasm/include/asm/kw_emu.h          |  86 +++++--
  arch/wasm/include/asm/processor.h       |  10 +
  arch/wasm/include/asm/ptrace.h          |  37 ++-
  arch/wasm/include/asm/seccomp.h         |  11 +-
  arch/wasm/include/asm/stat.h            |  50 ++++
  arch/wasm/include/asm/syscall.h         |  65 ++++-
  arch/wasm/include/asm/syscall_wrapper.h |   7 +
- arch/wasm/include/asm/unistd.h          |  14 ++
+ arch/wasm/include/asm/unistd.h          |  14 +
  arch/wasm/include/uapi/asm/fcntl.h      |   9 +
- arch/wasm/include/uapi/asm/prctl.h      |  14 ++
+ arch/wasm/include/uapi/asm/prctl.h      |  14 +
  arch/wasm/kernel/Makefile.syscalls      |  11 +-
  arch/wasm/kernel/cpu.c                  |  35 +++
  arch/wasm/kernel/process.c              |  37 ++-
  arch/wasm/kernel/prof.c                 |   8 +-
  arch/wasm/kernel/ptrace.c               |  31 +++
- arch/wasm/kernel/signal.c               | 317 ++++++++++++++++++++++++
- arch/wasm/kernel/sys.c                  |  56 +++++
+ arch/wasm/kernel/signal.c               | 323 ++++++++++++++++++++++++
+ arch/wasm/kernel/sys.c                  |  56 ++++
  arch/wasm/kernel/syscall_table.c        |   9 +-
- arch/wasm/kernel/traps.c                |  44 +++-
+ arch/wasm/kernel/traps.c                |  50 +++-
  arch/wasm/mm/fault.c                    |   6 +-
  arch/wasm/mm/sigpage.c                  |   7 +
- 25 files changed, 878 insertions(+), 53 deletions(-)
+ include/uapi/linux/eventpoll.h          |   2 +-
+ 26 files changed, 894 insertions(+), 54 deletions(-)
  create mode 100644 arch/wasm/configs/kw_x86.config
  create mode 100644 arch/wasm/include/asm/stat.h
  create mode 100644 arch/wasm/include/uapi/asm/prctl.h
@@ -213,7 +214,7 @@ index fc3631e5a..afb978c5c 100644
  #define SET_PERSONALITY(ex) \
  	set_personality(PER_LINUX | (current->personality & (~PER_MASK)))
 diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
-index 7db679113..5fa10fe0a 100644
+index 7db679113..dfab16faa 100644
 --- a/arch/wasm/include/asm/kw_emu.h
 +++ b/arch/wasm/include/asm/kw_emu.h
 @@ -7,13 +7,15 @@
@@ -257,7 +258,7 @@ index 7db679113..5fa10fe0a 100644
  /*
   * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
   * at 0, sp 248, pc 256, nzcv 264, fpcr 268, fpsr 272, tpidr_el0 280, and
-@@ -102,20 +112,59 @@ struct kw_regs {
+@@ -102,21 +112,63 @@ struct kw_regs {
  	uint64_t tpidr_el0;
  	uint64_t v[32][2] __attribute__((aligned(16)));
  } __attribute__((aligned(16)));
@@ -323,11 +324,12 @@ index 7db679113..5fa10fe0a 100644
 +				  instruction */
  	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
 +	KW_EV_DIVIDE = 7,      /* #DE from DIV/IDIV (x86-64): zero divisor or
-+				  quotient overflow; ev.insn = raw instruction.
-+				  The kernel delivers SIGFPE/FPE_INTDIV. */
++				  quotient overflow; ev.insn = raw instruction. The
++				  kernel delivers SIGFPE/FPE_INTDIV, not SIGILL. */
  };
  
-@@ -172,7 +221,9 @@ void kw_cpu_init(struct kw_cpu *cpu);
+ enum kw_access {
+@@ -172,7 +224,9 @@ void kw_cpu_init(struct kw_cpu *cpu);
   * taken branch out of a block (a branch the decoder followed
   * inside a page is not a check point). Every event leaves regs (incl. pc)
   * exactly at an instruction boundary. Data accesses may be unaligned
@@ -960,7 +962,7 @@ index 96f8810cf..f8adc5e09 100644
 +
 +#endif
 diff --git a/arch/wasm/kernel/signal.c b/arch/wasm/kernel/signal.c
-index 040dd1c65..32a8e5043 100644
+index 040dd1c65..9126dad98 100644
 --- a/arch/wasm/kernel/signal.c
 +++ b/arch/wasm/kernel/signal.c
 @@ -29,6 +29,8 @@
@@ -972,7 +974,7 @@ index 040dd1c65..32a8e5043 100644
  struct rt_sigframe {
  	struct siginfo info;
  	struct ucontext uc;
-@@ -322,3 +324,318 @@ static int __init init_signal_minsigstksz(void)
+@@ -322,3 +324,324 @@ static int __init init_signal_minsigstksz(void)
  	return 0;
  }
  arch_initcall(init_signal_minsigstksz);
@@ -1252,8 +1254,14 @@ index 040dd1c65..32a8e5043 100644
 +		case -ERESTARTNOHAND:
 +		case -ERESTARTSYS:
 +		case -ERESTARTNOINTR:
++			/* x86-64 restarts by re-executing SYSCALL with the
++			 * original number in rax (not x0: rax was the number),
++			 * which syscallno kept. */
++			regs->user.rax = regs->syscallno;
++			regs->user.rip = restart_addr;
++			break;
 +		case -ERESTART_RESTARTBLOCK:
-+			regs->user.rax = regs->orig_x0;
++			regs->user.rax = __NR_restart_syscall;
 +			regs->user.rip = restart_addr;
 +			break;
 +		}
@@ -1398,10 +1406,18 @@ index ae0e91d32..f09050aef 100644
  #undef __SYSCALL
  #define __SYSCALL(nr, call)	asmlinkage long __wasm_##call(const struct pt_regs *);
 diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
-index 525dacb6d..0e8a616f0 100644
+index 525dacb6d..831e49ed7 100644
 --- a/arch/wasm/kernel/traps.c
 +++ b/arch/wasm/kernel/traps.c
-@@ -55,6 +55,33 @@ asmlinkage long __wasm_sys_ni_syscall(const struct pt_regs *__unused)
+@@ -12,6 +12,7 @@
+ #include <linux/sched.h>
+ #include <linux/sched/debug.h>
+ #include <linux/signal.h>
++#include <linux/uaccess.h>
+ #include <linux/syscalls.h>
+ #include <asm/entry.h>
+ #include <asm/irq.h>
+@@ -55,6 +56,34 @@ asmlinkage long __wasm_sys_ni_syscall(const struct pt_regs *__unused)
  
  static void do_syscall(struct pt_regs *regs)
  {
@@ -1431,11 +1447,12 @@ index 525dacb6d..0e8a616f0 100644
 +			regs->user.rax = -ENOSYS;
 +		}
 +	}
++
 +#else
  	/* The low 32 bits, as arm64's el0_svc_common() takes an int. */
  	long nr = (int)regs->user.x[8];
  
-@@ -81,7 +108,7 @@ static void do_syscall(struct pt_regs *regs)
+@@ -81,7 +110,7 @@ static void do_syscall(struct pt_regs *regs)
  			regs->user.x[0] = -ENOSYS;
  		}
  	}
@@ -1444,7 +1461,7 @@ index 525dacb6d..0e8a616f0 100644
  	syscall_exit_to_user_mode(regs);
  }
  
-@@ -93,7 +120,7 @@ static void do_user_trap(struct pt_regs *regs, int signo, int code,
+@@ -93,7 +122,7 @@ static void do_user_trap(struct pt_regs *regs, int signo, int code,
  	if (show_unhandled_signals && unhandled_signal(current, signo))
  		pr_info_ratelimited("%s[%d]: unhandled trap sig=%d pc=%llx addr=%lx insn=%llx\n",
  				    current->comm, task_pid_nr(current), signo,
@@ -1453,7 +1470,7 @@ index 525dacb6d..0e8a616f0 100644
  				    (unsigned long long)wasm_kw_cpu->ev.insn);
  	force_sig_fault(signo, code, (void __user *)addr);
  	local_irq_disable();
-@@ -220,7 +247,7 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+@@ -220,7 +249,7 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
  
  			cpu->budget += step_rest;
  			if (retired && (ev == KW_EV_BUDGET || ev == KW_EV_INTERRUPT)) {
@@ -1462,7 +1479,7 @@ index 525dacb6d..0e8a616f0 100644
  				continue;
  			}
  		}
-@@ -237,13 +264,18 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+@@ -237,13 +266,22 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
  			do_user_fault(regs, cpu->ev.addr, cpu->ev.access);
  			break;
  		case KW_EV_ILLEGAL:
@@ -1472,11 +1489,11 @@ index 525dacb6d..0e8a616f0 100644
  		case KW_EV_BREAKPOINT:
 -			do_user_trap(regs, SIGTRAP, TRAP_BRKPT, regs->user.pc);
 +			do_user_trap(regs, SIGTRAP, TRAP_BRKPT, instruction_pointer(regs));
- 			break;
++			break;
 +		case KW_EV_DIVIDE:
 +			/* x86-64 #DE: a divide error is SIGFPE, unlike #UD. */
 +			do_user_trap(regs, SIGFPE, FPE_INTDIV, instruction_pointer(regs));
-+			break;
+ 			break;
  		case KW_EV_MISALIGNED:
 +			#ifdef CONFIG_WASM_USER_X86_64
 +			/* x86-64: an aligned SSE access faults as SIGSEGV. */
@@ -1487,7 +1504,7 @@ index 525dacb6d..0e8a616f0 100644
  			break;
  		case KW_EV_BUDGET:
  		case KW_EV_INTERRUPT:
-@@ -251,7 +283,7 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+@@ -251,7 +289,7 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
  			cpu->budget = KW_SLICE;
  			break;
  		default:
@@ -1541,11 +1558,12 @@ index 09c4dc249..5d63c2c7c 100644
  	return ret;
 +#endif
  }
-
 diff --git a/include/uapi/linux/eventpoll.h b/include/uapi/linux/eventpoll.h
+index 4f4b948ef..21055dccd 100644
 --- a/include/uapi/linux/eventpoll.h
 +++ b/include/uapi/linux/eventpoll.h
 @@ -74,7 +74,7 @@
+  *
   * UML/x86_64 needs the same packing as x86_64
   */
 -#ifdef __x86_64__
@@ -1555,3 +1573,4 @@ diff --git a/include/uapi/linux/eventpoll.h b/include/uapi/linux/eventpoll.h
  #define EPOLL_PACKED
 -- 
 2.53.0
+

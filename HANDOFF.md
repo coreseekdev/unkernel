@@ -3,8 +3,10 @@
 # Handoff: x86-64 browser support and RISC-V revival
 
 Date: 2026-11-27
-Status: phases 0 and 1 are done; phase 2 boots Alpine and a Debian 13
-amd64 userspace. See "Current state" below before starting.
+Status: phases 0 and 1 are done; phase 2 boots Alpine and Debian 13
+amd64, builds apt's package cache and runs Firefox 153.8.0esr headless
+(its screenshot is byte-identical to the native run). See "Current
+state" below before starting.
 
 ## Current state (2026-11-27)
 
@@ -72,8 +74,17 @@ Done in this tree:
   destination based on rSP (the address is computed after the increment)
   and `POP rSP`, 8-bit `DIV`/`IDIV` (AX dividend, AL/AH result) and a
   real #DE as SIGFPE/FPE_INTDIV (`KW_EV_DIVIDE`); FCMOV with the parity
-  conditions also went in for `strtold`.
-- **Kernel fixes in 0056:** `rt_sigreturn` reads the frame at `rsp - 8`
+  conditions also went in for `strtold`. Firefox's screenshot corruption
+  was `PINSRW` ignoring imm[1:0] (it always wrote the first 16-bit word),
+  which broke GCC's vectorized `ct_data` packing in zlib's `build_tree`:
+  the dynamic Huffman trees were wrong, so the PNG's IDAT was an invalid
+  zlib stream even though the pixels were right.
+- **Kernel fixes in 0056:** x86-64 syscall restart used `orig_x0`
+  (rdi, the first argument) as `rax`, so a futex wait interrupted by a
+  signal restarted as a random syscall and glibc aborted with "The futex
+  facility returned an unexpected error code"; use `syscallno` (and
+  `restart_syscall` for `ERESTART_RESTARTBLOCK`). `rt_sigreturn` reads
+  the frame at `rsp - 8`
   because the return through `sa_restorer` has already popped
   `pretcode`; `CONFIG_WASM_USER_X86_64` selects x86-64's `struct stat`
   (`arch/wasm/include/asm/stat.h`) and the asm-generic `O_*` bits
@@ -86,18 +97,21 @@ Done in this tree:
   when `CONFIG_WASM_USER_X86_64` too.
 - **Debian apt and Firefox (2026-11-27).** The package cache builds:
   `apt-cache policy` completes with status 0 on the full Debian trixie
-  lists (including the 56 MB main Packages.lz4), with ASLR on. The old
-  `memcmp` key length of `-1` was not a string length: 8-bit `dec` set OF
-  when the result was negative, so glibc's memcmp length-0 tail
-  (`dec edx; jle`) fell through and used the decremented index. Firefox
-  153.8.0esr (Debian trixie amd64) runs `--version` and starts headless;
-  its JIT restores the return address with `push [rsp]; mov [rsp+8], 1`
-  and `pop [rsp]`, which needs POP's "address after the increment" rule,
-  and an 8-bit `div` in its integer division exposed DIV r/m8's AX
-  dividend (AL/AH result) as the last startup blocker. FCMOV (with the
-  parity conditions) is implemented for glibc's strtold. The interpreter
-  is still the reference tier, so headless startup is minutes, not
-  seconds.
+  lists (including the 56 MB main Packages.lz4) with ASLR on, and
+  `apt-get -s install hello` plans the package. The old `memcmp` key
+  length of `-1` was not a string length: 8-bit `dec` set OF when the
+  result was negative, so glibc's memcmp length-0 tail (`dec edx; jle`)
+  fell through and used the decremented index. Firefox 153.8.0esr
+  (Debian trixie amd64) runs `--version` and `--headless
+  --screenshot` to completion: exit status 0, a 1366x768 PNG **byte
+  identical to the same Firefox run in a native chroot**. Its JIT
+  restores the return address with `push [rsp]; mov [rsp+8], 1` and
+  `pop [rsp]` (POP's address-after-increment rule), its integer division
+  exposed DIV r/m8's AX dividend (AL/AH result), and its zlib tree
+  builder exposed PINSRW's word selection. FCMOV (with the parity
+  conditions) is implemented for glibc's strtold. The interpreter is
+  still the reference tier: the headless screenshot takes ~100 s of
+  guest time (~0.4 s natively) on this host.
 - **Remaining phase 2 work:** `df` still reports "can't find mount
   point"; x86-64 ptrace regsets and core-dump notes are not implemented
   (`HAVE_ARCH_TRACEHOOK` stays off for x86); AVX/SSSE3/SSE4 are not
@@ -106,10 +120,11 @@ Done in this tree:
   Firefox (display, input, sound) and the apt-get install path are next
   after the headless screenshot.
 
-The next round verifies the Firefox headless screenshot and the apt
-install path, then runs threads/futex/signal conformance with
-kwtest/abitest before the decoded-op tier. Keep the reference
-interpreter as the oracle for the tier and reuse the guest corpus.
+The apt cache and the headless Firefox screenshot are verified. The next
+round is a user-visible Firefox (display/input), a real apt-get install
+(not just -s), and threads/futex/signal conformance with kwtest/abitest
+before the decoded-op tier. Keep the reference interpreter as the oracle
+for the tier and reuse the guest corpus.
 
 ## 1. Objective and priorities
 
