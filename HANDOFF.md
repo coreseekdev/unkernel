@@ -67,30 +67,44 @@ Done in this tree:
   immediate packed-shift clobber (ModRM.reg overwritten) is also fixed.
   Real Debian user space also exposed `fistp` ignoring the x87 control
   word's truncation mode (musl's `strtold` sets it) and the missing
-  `FXSAVE`/`FXRSTOR`; both are implemented now.
+  `FXSAVE`/`FXRSTOR`; both are implemented now. The apt and Firefox
+  crashes added `DEC 0`/`INC` OF at the signed edges, POP with a memory
+  destination based on rSP (the address is computed after the increment)
+  and `POP rSP`, 8-bit `DIV`/`IDIV` (AX dividend, AL/AH result) and a
+  real #DE as SIGFPE/FPE_INTDIV (`KW_EV_DIVIDE`); FCMOV with the parity
+  conditions also went in for `strtold`.
 - **Kernel fixes in 0056:** `rt_sigreturn` reads the frame at `rsp - 8`
   because the return through `sa_restorer` has already popped
   `pretcode`; `CONFIG_WASM_USER_X86_64` selects x86-64's `struct stat`
   (`arch/wasm/include/asm/stat.h`) and the asm-generic `O_*` bits
   (`arch/wasm/include/uapi/asm/fcntl.h`), which fixed `stat`/`ls`/PATH
   lookup and `open(O_DIRECTORY)`.
-- **Remaining phase 2 work:** Debian's `apt` cannot yet build its package
-  cache: `apt-cache policy` and `apt-get install` reach `memcmp` with a
-  key length of `-1` in a `libapt-pkg` hash lookup, even with the lists
-  removed or an empty dpkg status. The list files and their lz4
-  decompression match the host, so the next lead is the remaining libc
-  string/memory calls (`strchrnul`, `strcasecmp`, `memrchr`, `memmem`) or
-  the cache generator's string handling. `df` still reports "can't find
-  mount point"; x86-64 ptrace regsets and core-dump notes are not
-  implemented (`HAVE_ARCH_TRACEHOOK` stays off for x86); AVX/SSSE3/SSE4
-  are not advertised (Debian's baseline glibc paths are used); the
-  decoded-op tier and wasm JIT are phase 4; riscv64 is phase 3.
+- **Debian apt and Firefox (2026-11-27).** The package cache builds:
+  `apt-cache policy` completes with status 0 on the full Debian trixie
+  lists (including the 56 MB main Packages.lz4), with ASLR on. The old
+  `memcmp` key length of `-1` was not a string length: 8-bit `dec` set OF
+  when the result was negative, so glibc's memcmp length-0 tail
+  (`dec edx; jle`) fell through and used the decremented index. Firefox
+  153.8.0esr (Debian trixie amd64) runs `--version` and starts headless;
+  its JIT restores the return address with `push [rsp]; mov [rsp+8], 1`
+  and `pop [rsp]`, which needs POP's "address after the increment" rule,
+  and an 8-bit `div` in its integer division exposed DIV r/m8's AX
+  dividend (AL/AH result) as the last startup blocker. FCMOV (with the
+  parity conditions) is implemented for glibc's strtold. The interpreter
+  is still the reference tier, so headless startup is minutes, not
+  seconds.
+- **Remaining phase 2 work:** `df` still reports "can't find mount
+  point"; x86-64 ptrace regsets and core-dump notes are not implemented
+  (`HAVE_ARCH_TRACEHOOK` stays off for x86); AVX/SSSE3/SSE4 are not
+  advertised (Debian's baseline glibc paths are used); the decoded-op
+  tier and wasm JIT are phase 4; riscv64 is phase 3. A user-visible
+  Firefox (display, input, sound) and the apt-get install path are next
+  after the headless screenshot.
 
-The next round fixes the apt/libapt-pkg cache path, then brings up the
-Debian package install and Firefox (headless first), then
-threads/futex/signal conformance with kwtest/abitest. Keep the reference
-interpreter as the oracle for the decoded-op tier and reuse the guest
-corpus.
+The next round verifies the Firefox headless screenshot and the apt
+install path, then runs threads/futex/signal conformance with
+kwtest/abitest before the decoded-op tier. Keep the reference
+interpreter as the oracle for the tier and reuse the guest corpus.
 
 ## 1. Objective and priorities
 
