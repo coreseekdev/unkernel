@@ -120,7 +120,22 @@ Done in this tree:
   guest time (~0.4 s natively) on this host. The decoded basic-block tier
   (`src/x86_64/run.zig`, `run`) is now the default for UP x86-64: a
   benchmark loop went 41 s to 21 s, and Firefox's `--headless` render stays
-  byte-identical. SMP builds keep `runRef` until the cache is per-CPU.
+  byte-identical. Conditional branches stay inside a block (a taken branch
+  to another instruction of the block is an in-block jump), so a loop runs
+  as one cached block without a lookup or raw-byte revalidation per
+  iteration; that is another ~12% on the benchmark, and RDTSC reads the
+  instruction count from the run context instead of a per-instruction
+  store to `struct kw_cpu`. SMP builds keep `runRef` until the cache is
+  per-CPU.
+- **Compatibility suite (2026-11-27).** `guest/distro/debian/compat/`
+  builds a Debian trixie amd64 image (Docker) whose init runs a
+  deterministic shell, coreutils, tar/gzip and perl suite plus the four
+  static x86-64 guests, then powers off. The same rootfs runs in a native
+  chroot; on the decoded tier the guest output matched it line for line
+  (`COMPAT-START` .. `COMPAT-DONE`), including fork, signals, pipes,
+  sorting, regex, FP formatting, 64-bit arithmetic, the dynamic loader and
+  the static guests. It is the broad regression check for the decoded
+  tier; README.md has the build and diff commands.
 - **Remaining phase 2 work:** `kwtest` reports 0 failures on x86-64
   (including its FP hot loop and thread/fork/signal checks); x86-64
   ptrace regsets and core-dump notes are not implemented
