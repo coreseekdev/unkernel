@@ -69,8 +69,11 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
 // effective address; `eaOf` reads base/index at execution). A hit validates
 // the raw bytes at the host address and runs the cached `Insn`s without
 // decoding; a self-modifying store or a remapped page changes the raw bytes
-// or the host tag and forces a re-decode. Blocks end after a control-flow
-// instruction or at a page boundary, so a branch target starts a new lookup.
+// or the host tag and forces a re-decode. Conditional branches do not end a
+// block: a taken branch to another instruction of the block re-enters it in
+// place, so a loop runs in one cached block instead of a lookup and a
+// validation per iteration. Only calls, returns and indirect/unconditional
+// jumps leave it (an unconditional jump may still loop back in).
 //
 // This is the decoded-op tier (HANDOFF phase 4), not the wasm JIT. The cache
 // is global and its entries are immutable after decode; the checks make it
@@ -80,6 +83,8 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
 const block_insns = 24;
 const block_sets = 256;
 const BIns = struct {
+    /// Offset of the instruction from the block's first byte.
+    off: u16 = 0,
     len: u8 = 0,
     raw: u64 = 0,
     ins: decode.Insn = .{},
@@ -122,9 +127,23 @@ fn blockGet(cpu: *Cpu, pc: u64, host: u64) ?*const BEntry {
     return e;
 }
 
+/// A conditional branch does not end a block: both its fallthrough (the
+/// next instruction) and, when the target is inside the block, its taken
+/// path keep running here, so a loop is one cached block instead of a
+/// lookup and a revalidation per iteration. Calls, returns and the
+/// unconditional jump end the block; the jump can still loop back into it.
 fn endsBlock(op: Op) bool {
     return switch (op) {
-        .jmp, .call, .ret, .jcc, .loopne, .loope, .loop, .jrcxz, .syscall, .int3, .ud2, .hlt, .int_n => true,
+        .jmp, .call, .ret, .syscall, .int3, .ud2, .hlt, .int_n => true,
+        else => false,
+    };
+}
+
+/// A direct branch whose target may be another instruction of the same
+/// block (indirect jumps and returns have arbitrary targets).
+fn followsInBlock(op: Op) bool {
+    return switch (op) {
+        .jmp, .jcc, .loopne, .loope, .loop, .jrcxz => true,
         else => false,
     };
 }
@@ -141,7 +160,7 @@ fn blockDecode(s: c.St, pc: u64, host: u64) ?*const BEntry {
         if (local.len == 0 or local.len > 8) break;
         if (off + local.len > 4096) break;
         if (local.len >= 5 and off + 8 > 4096) break;
-        e.ins[n] = .{ .len = local.len, .raw = local.raw, .ins = local };
+        e.ins[n] = .{ .off = @intCast(cur - pc), .len = local.len, .raw = local.raw, .ins = local };
         n += 1;
         cur +%= local.len;
         if (endsBlock(local.op) or (cur & 4095) == 0) break;
@@ -172,12 +191,11 @@ pub fn runDecoded(cpu: *Cpu, regs: *Regs) u32 {
     const irq = cpu.irq_pending;
     if (irq) |p| if (p.* != 0) return stopEvent(cpu, .interrupt, .entry, regs.rip);
     const h = &cpu.priv.hart;
-    const s: c.St = .{ .r = regs, .h = h, .m = cpu };
+    var s: c.St = .{ .r = regs, .h = h, .m = cpu };
     var since_poll: u32 = 0;
     while (true) {
         if (left == 0) return stopEvent(cpu, .budget, .decoded, regs.rip);
         const ipc = regs.rip;
-        cpu.icount = icount0 +% (start - left);
         const host = cpu.execHost(ipc) catch {
             cpu.priv.smc = 0;
             return event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0);
@@ -185,39 +203,55 @@ pub fn runDecoded(cpu: *Cpu, regs: *Regs) u32 {
         var entry = blockGet(cpu, ipc, host);
         if (entry == null) entry = blockDecode(s, ipc, host);
         if (entry) |be| {
-            var cur = be.pc;
             var k: usize = 0;
             var brk = false;
-            while (k < be.n) : (k += 1) {
-                if (left == 0) {
-                    regs.rip = cur;
-                    return stopEvent(cpu, .budget, .decoded, cur);
-                }
-                const at = cur;
+            while (k < be.n) {
                 const bi = &be.ins[k];
-                cpu.icount = icount0 +% (start - left);
-                cur +%= bi.len;
-                regs.rip = cur;
+                const at = be.pc + bi.off;
+                if (left == 0) {
+                    regs.rip = at;
+                    return stopEvent(cpu, .budget, .decoded, at);
+                }
+                s.icount = icount0 +% (start - left);
+                regs.rip = at +% bi.len;
                 const e = exec.one(s, &bi.ins) catch {
                     regs.rip = at;
                     cpu.priv.smc = 0;
                     return event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0);
                 };
                 const wrote_code = cpu.priv.smc != 0;
-                cpu.priv.smc = 0;
+                if (wrote_code) cpu.priv.smc = 0;
                 switch (e) {
                     .next => {
                         left -= 1;
                         since_poll += 1;
-                        if (wrote_code) brk = true else if (since_poll < poll_every) continue;
+                        if (wrote_code) {
+                            brk = true;
+                        } else {
+                            k += 1;
+                            if (since_poll < poll_every) continue;
+                        }
                     },
                     .jump => {
                         left -= 1;
+                        if (!wrote_code and followsInBlock(bi.ins.op)) {
+                            const toff = regs.rip -% be.pc;
+                            var j: usize = 0;
+                            while (j < be.n and be.ins[j].off != toff) : (j += 1) {}
+                            if (j < be.n) {
+                                k = j;
+                                since_poll = 0;
+                                if (irq) |p| if (p.* != 0) {
+                                    return stopEvent(cpu, .interrupt, .decoded, regs.rip);
+                                };
+                                continue;
+                            }
+                        }
                         brk = true;
                     },
                     .trap => {
                         if (h.trap == .syscall) {
-                            left -= 1;
+                            left -= 1; // SYSCALL retires; rip is already past it
                             return event(cpu, .syscall, 0, 0, 0);
                         }
                         regs.rip = at;
@@ -235,7 +269,6 @@ pub fn runDecoded(cpu: *Cpu, regs: *Regs) u32 {
                 };
                 if (brk) break;
             }
-            if (brk) continue;
             continue;
         }
         // The first instruction could not be cached (long, straddling or a
@@ -257,6 +290,7 @@ pub fn runDecoded(cpu: *Cpu, regs: *Regs) u32 {
                 return event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0);
             };
         }
+        s.icount = icount0 +% (start - left);
         regs.rip = ipc +% local.len;
         const e = exec.one(s, &local) catch {
             regs.rip = ipc;
@@ -301,13 +335,13 @@ pub fn runRef(cpu: *Cpu, regs: *Regs) u32 {
     const irq = cpu.irq_pending;
     if (irq) |p| if (p.* != 0) return stopEvent(cpu, .interrupt, .entry, regs.rip);
     const h = &cpu.priv.hart;
-    const s: c.St = .{ .r = regs, .h = h, .m = cpu };
+    var s: c.St = .{ .r = regs, .h = h, .m = cpu };
     var since_poll: u32 = 0;
     while (true) {
         if (left == 0) return stopEvent(cpu, .budget, .budget, regs.rip);
         const ipc = regs.rip;
         // RDTSC and the counter read see the instructions retired so far.
-        cpu.icount = icount0 +% (start - left);
+        s.icount = icount0 +% (start - left);
         // Instruction fetch is an exec access: a non-executable page faults
         // here even though the decoder reads the bytes through the data
         // path (an instruction may straddle into the next page).

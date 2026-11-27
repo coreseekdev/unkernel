@@ -35,6 +35,9 @@ pub const St = struct {
     r: *Regs,
     h: *Hart,
     m: *Cpu,
+    /// Instructions retired before this one (RDTSC). Kept in the context so
+    /// the run loop need not store to cpu.icount for every instruction.
+    icount: u64 = 0,
 
     pub inline fn priv(s: St) *state.Priv {
         return &s.m.priv.x86_64;

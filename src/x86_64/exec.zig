@@ -1130,7 +1130,7 @@ fn cpuid(s: St) Error!Exit {
 }
 
 fn rdtsc(s: St, aux: bool) Error!Exit {
-    const t = s.m.icount *% 3;
+    const t = s.icount *% 3;
     s.r.rax = @truncate(t);
     s.r.rdx = t >> 32;
     if (aux) s.r.rcx = 0;
