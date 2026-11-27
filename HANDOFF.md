@@ -78,7 +78,12 @@ Done in this tree:
   `pretcode`; `CONFIG_WASM_USER_X86_64` selects x86-64's `struct stat`
   (`arch/wasm/include/asm/stat.h`) and the asm-generic `O_*` bits
   (`arch/wasm/include/uapi/asm/fcntl.h`), which fixed `stat`/`ls`/PATH
-  lookup and `open(O_DIRECTORY)`.
+  lookup and `open(O_DIRECTORY)`. `struct epoll_event` packs only under
+  `__x86_64__`; the wasm kernel is not `__x86_64__`, so with the x86 user
+  ABI it read the guest's 12-byte packed event as 16 bytes and the data
+  field came from the wrong offset. Firefox's libevent never matched its
+  events and spun in `event_base_loop`/`epoll_wait`; the header now packs
+  when `CONFIG_WASM_USER_X86_64` too.
 - **Debian apt and Firefox (2026-11-27).** The package cache builds:
   `apt-cache policy` completes with status 0 on the full Debian trixie
   lists (including the 56 MB main Packages.lz4), with ASLR on. The old
