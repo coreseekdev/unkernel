@@ -1,0 +1,30 @@
+#!/bin/sh
+# unkernel: the init of a Debian + Firefox test image (guest/distro/debian/
+# firefox/build.sh). It is a headless screenshot run, not a desktop: the
+# image exists to prove Firefox starts and renders under the x86-64 kernel.
+# The base initramfs' base init execs /usr/local/sbin/kw-init; the kw layer
+# supplies /usr/lib/kw/rc and the mounts, the image supplies Firefox and a
+# warm profile at /opt/ffp.
+/usr/lib/kw/rc 2>/dev/null || true
+mkdir -p /dev/shm /tmp/ffshots
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
+rm -rf /tmp/ffp
+cp -a /opt/ffp /tmp/ffp 2>/dev/null || mkdir -p /tmp/ffp
+export HOME=/root
+export MOZ_CRASHREPORTER_DISABLE=1 MOZ_CRASHREPORTER=0
+export MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GPU_SANDBOX=1
+export MOZ_DISABLE_RDD_SANDBOX=1
+export MOZ_HEADLESS_WIDTH=1366 MOZ_HEADLESS_HEIGHT=768
+echo FF-TEST
+/usr/bin/firefox-esr --version
+/usr/bin/timeout 1000 /usr/bin/firefox-esr --headless --no-remote \
+	--profile /tmp/ffp --screenshot /tmp/ffshots/shot.png about:blank
+echo "firefox=$?"
+ls -l /tmp/ffshots/
+if [ -f /tmp/ffshots/shot.png ]; then
+	echo PNGSTART
+	/usr/bin/base64 -w76 /tmp/ffshots/shot.png
+	echo PNGEND
+fi
+echo FF-DONE
+exec /run/kw-lower/bin/busybox poweroff -f

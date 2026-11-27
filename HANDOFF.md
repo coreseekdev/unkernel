@@ -117,14 +117,18 @@ Done in this tree:
   hello` fetches, unpacks, configures and runs the program; the init must
   run `/usr/lib/kw/rc` and `/usr/lib/kw/net` for DHCP. The interpreter is
   still the reference tier: the headless screenshot takes ~100 s of
-  guest time (~0.4 s natively) on this host.
+  guest time (~0.4 s natively) on this host. The decoded basic-block tier
+  (`src/x86_64/run.zig`, `run`) is now the default for UP x86-64: a
+  benchmark loop went 41 s to 21 s, and Firefox's `--headless` render stays
+  byte-identical. SMP builds keep `runRef` until the cache is per-CPU.
 - **Remaining phase 2 work:** `kwtest` reports 0 failures on x86-64
   (including its FP hot loop and thread/fork/signal checks); x86-64
   ptrace regsets and core-dump notes are not implemented
   (`HAVE_ARCH_TRACEHOOK` stays off for x86);
   AVX/SSSE3/SSE4 are not advertised (Debian's baseline glibc paths are
-  used); the decoded-op tier and wasm JIT are phase 4; riscv64 is phase
-  3. A user-visible Firefox (display, input, sound) is next after the
+  used); the decoded-op tier is in `src/x86_64/run.zig` (basic blocks of
+  stateless Insns, raw-byte validated, SMC-aware, UP only) and the wasm
+  JIT remains phase 4; riscv64 is phase 3. A user-visible Firefox (display, input, sound) is next after the
   headless screenshot. The page's Wayland path needs an x86-64 `wlandr`
   relay; `pins-x86_64.sh` pins none yet (the A64 pin set has one), and
   X11 on kwfb is the alternative. `df` works on the Debian trixie overlay
@@ -357,7 +361,10 @@ checks as x86-64, with no A64 regression.
 
 ### Phase 4: wasm JIT for x86-64 and riscv64
 
-For x86-64, add a decoded-op tier and use `src/emu/jitcore.zig` for hot blocks.
+The x86-64 decoded-op tier is in `src/x86_64/run.zig` (block cache of
+stateless `Insn`s; the reference `runRef` remains the oracle). Next use
+`src/emu/jitcore.zig` for hot blocks; the SMP path falls back to `runRef`
+until the cache is per-CPU.
 Translate frequent integer, branch and memory operations first; complex FP,
 SIMD and system operations may call the reference interpreter.
 

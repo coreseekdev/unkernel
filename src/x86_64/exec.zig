@@ -33,7 +33,7 @@ pub fn one(s: St, ins: *const Insn) Error!Exit {
         .mov => try movOp(s, ins),
         .movzx, .movsx, .movsxd => try movx(s, ins),
         .lea => blk: {
-            common.regWrite(s.r, ins.reg, ins.opsz, ins.pfx.rex != 0, ins.ea);
+            common.regWrite(s.r, ins.reg, ins.opsz, ins.pfx.rex != 0, eaOf(s, ins));
             break :blk .next;
         },
         .xchg => try xchg(s, ins),
@@ -172,13 +172,28 @@ pub fn one(s: St, ins: *const Insn) Error!Exit {
 
 // ---- operand helpers -------------------------------------------------------------
 
+/// Effective address of a memory operand. `Insn` is stateless: the base and
+/// index registers are read now, and rip is the next instruction (run.zig
+/// advances it before exec), so a cached Insn can run at any later time.
+fn eaOf(s: St, ins: *const Insn) u64 {
+    var ea: u64 = @bitCast(ins.disp);
+    if (ins.rip_rel) {
+        ea = s.r.rip +% ea;
+    } else {
+        if (ins.has_base) ea +%= common.gpr(s.r, ins.base).*;
+        if (ins.has_index) ea +%= common.gpr(s.r, ins.index).* << ins.scale;
+    }
+    if (ins.addr32) ea &= 0xffff_ffff;
+    return ea;
+}
+
 fn rmRead(s: St, ins: *const Insn, sz: u8) Error!u64 {
-    if (ins.mem) return common.readMem(s, ins.ea, sz, ins.pfx.seg);
+    if (ins.mem) return common.readMem(s, eaOf(s, ins), sz, ins.pfx.seg);
     return common.regRead(s.r, ins.rm, sz, ins.pfx.rex != 0);
 }
 
 fn rmWrite(s: St, ins: *const Insn, sz: u8, v: u64) Error!void {
-    if (ins.mem) return common.writeMem(s, ins.ea, sz, ins.pfx.seg, v);
+    if (ins.mem) return common.writeMem(s, eaOf(s, ins), sz, ins.pfx.seg, v);
     common.regWrite(s.r, ins.rm, sz, ins.pfx.rex != 0, v);
 }
 
@@ -319,7 +334,7 @@ fn movOp(s: St, ins: *const Insn) Error!Exit {
 
 fn movx(s: St, ins: *const Insn) Error!Exit {
     const src_sz: u8 = if (ins.op == .movsxd) 4 else ins.src_sz;
-    const v = if (ins.mem) try common.readMem(s, ins.ea, src_sz, ins.pfx.seg) else common.regRead(s.r, ins.rm, src_sz, ins.pfx.rex != 0);
+    const v = if (ins.mem) try common.readMem(s, eaOf(s, ins), src_sz, ins.pfx.seg) else common.regRead(s.r, ins.rm, src_sz, ins.pfx.rex != 0);
     const r: u64 = switch (ins.op) {
         .movzx => v,
         .movsx, .movsxd => common.sextR(v, src_sz * 8),
@@ -391,7 +406,7 @@ fn pop(s: St, ins: *const Insn) Error!Exit {
         // SpiderMonkey's JIT saves the return address with `push [rsp];
         // mov [rsp+8], 1` and restores it with `pop [rsp]` after
         // `mov rsp, rbp; pop rbp`.
-        var ea = ins.ea;
+        var ea = eaOf(s, ins);
         if (ins.has_base and ins.base == 4) ea +%= sz;
         if (ins.addr32) ea &= 0xffff_ffff;
         try common.writeMem(s, ea, sz, ins.pfx.seg, v);
@@ -757,7 +772,7 @@ fn bitTest(s: St, ins: *const Insn) Error!Exit {
         common.regRead(s.r, ins.reg, sz, ins.pfx.rex != 0)
     else
         ins.imm;
-    var addr = ins.ea;
+    var addr = eaOf(s, ins);
     var width: u8 = sz;
     var v: u64 = undefined;
     var bit: u6 = undefined;
@@ -765,7 +780,7 @@ fn bitTest(s: St, ins: *const Insn) Error!Exit {
         if (ins.aux == 1) {
             // An immediate offset is taken modulo the operand width; the
             // address does not move.
-            v = try common.readMem(s, ins.ea, sz, ins.pfx.seg);
+            v = try common.readMem(s, eaOf(s, ins), sz, ins.pfx.seg);
             bit = @intCast(idx % bits);
         } else {
             // A register offset is signed and moves the bit base by bytes.
@@ -966,26 +981,26 @@ fn xadd(s: St, ins: *const Insn) Error!Exit {
 }
 
 fn cmpxchgxb(s: St, ins: *const Insn) Error!Exit {
-    if (ins.op == .cmpxchg16b and ins.ea & 15 != 0) return common.misaligned(s, ins.ea);
+    if (ins.op == .cmpxchg16b and eaOf(s, ins) & 15 != 0) return common.misaligned(s, eaOf(s, ins));
     if (ins.op == .cmpxchg8b) {
-        const mem = try common.readMem(s, ins.ea, 8, ins.pfx.seg);
+        const mem = try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg);
         const expected: u64 = ((s.r.rdx & 0xffff_ffff) << 32) | (s.r.rax & 0xffff_ffff);
         if (mem == expected) {
             s.r.eflags |= state.ZF;
             const nv: u64 = ((s.r.rcx & 0xffff_ffff) << 32) | (s.r.rbx & 0xffff_ffff);
-            try common.writeMem(s, ins.ea, 8, ins.pfx.seg, nv);
+            try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, nv);
         } else {
             s.r.eflags &= ~state.ZF;
             s.r.rax = (s.r.rax & ~@as(u64, 0xffff_ffff)) | (mem & 0xffff_ffff);
             s.r.rdx = (s.r.rdx & ~@as(u64, 0xffff_ffff)) | (mem >> 32);
         }
     } else {
-        const lo = try common.readMem(s, ins.ea, 8, ins.pfx.seg);
-        const hi = try common.readMem(s, ins.ea + 8, 8, ins.pfx.seg);
+        const lo = try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg);
+        const hi = try common.readMem(s, eaOf(s, ins) + 8, 8, ins.pfx.seg);
         if (lo == s.r.rax and hi == s.r.rdx) {
             s.r.eflags |= state.ZF;
-            try common.writeMem(s, ins.ea, 8, ins.pfx.seg, s.r.rbx);
-            try common.writeMem(s, ins.ea + 8, 8, ins.pfx.seg, s.r.rcx);
+            try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, s.r.rbx);
+            try common.writeMem(s, eaOf(s, ins) + 8, 8, ins.pfx.seg, s.r.rcx);
         } else {
             s.r.eflags &= ~state.ZF;
             s.r.rax = lo;
@@ -1186,12 +1201,12 @@ inline fn fromF64s(a: [2]f64) Vec {
 }
 
 fn sseSrc(s: St, ins: *const Insn) Error!Vec {
-    if (ins.mem) return common.readMem128(s, ins.ea, ins.pfx.seg);
+    if (ins.mem) return common.readMem128(s, eaOf(s, ins), ins.pfx.seg);
     return s.r.xmm[ins.rm];
 }
 
 fn sseStore(s: St, ins: *const Insn, v: Vec) Error!void {
-    if (ins.mem) return common.writeMem128(s, ins.ea, ins.pfx.seg, v);
+    if (ins.mem) return common.writeMem128(s, eaOf(s, ins), ins.pfx.seg, v);
     s.r.xmm[ins.rm] = v;
 }
 
@@ -1270,7 +1285,7 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
             }
         },
         .movaps, .movapd, .movdqa => {
-            if (ins.mem and ins.ea & 15 != 0) return common.misaligned(s, ins.ea);
+            if (ins.mem and eaOf(s, ins) & 15 != 0) return common.misaligned(s, eaOf(s, ins));
             if (ins.aux == 1) {
                 const v = dst.*;
                 try sseStore(s, ins, v);
@@ -1282,14 +1297,14 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
             if (ins.aux == 1) {
                 const v = dst[0];
                 if (ins.mem) {
-                    try common.writeMem(s, ins.ea, 4, ins.pfx.seg, @truncate(v));
+                    try common.writeMem(s, eaOf(s, ins), 4, ins.pfx.seg, @truncate(v));
                 } else {
                     var cur = s.r.xmm[ins.rm];
                     cur[0] = (cur[0] & ~@as(u64, 0xffff_ffff)) | (v & 0xffff_ffff);
                     s.r.xmm[ins.rm] = cur;
                 }
             } else {
-                const x: u64 = if (ins.mem) try common.readMem(s, ins.ea, 4, ins.pfx.seg) else s.r.xmm[ins.rm][0];
+                const x: u64 = if (ins.mem) try common.readMem(s, eaOf(s, ins), 4, ins.pfx.seg) else s.r.xmm[ins.rm][0];
                 if (ins.mem) {
                     dst.* = .{ x & 0xffff_ffff, 0 };
                 } else {
@@ -1301,12 +1316,12 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
             if (ins.aux == 1) {
                 const v = dst[0];
                 if (ins.mem) {
-                    try common.writeMem(s, ins.ea, 8, ins.pfx.seg, v);
+                    try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, v);
                 } else {
                     s.r.xmm[ins.rm][0] = v;
                 }
             } else {
-                const x: u64 = if (ins.mem) try common.readMem(s, ins.ea, 8, ins.pfx.seg) else s.r.xmm[ins.rm][0];
+                const x: u64 = if (ins.mem) try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg) else s.r.xmm[ins.rm][0];
                 if (ins.mem) {
                     dst.* = .{ x, 0 };
                 } else {
@@ -1318,7 +1333,7 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
             if (ins.aux == 1) {
                 const v = dst[0];
                 if (ins.mem) {
-                    try common.writeMem(s, ins.ea, ins.opsz, ins.pfx.seg, v);
+                    try common.writeMem(s, eaOf(s, ins), ins.opsz, ins.pfx.seg, v);
                 } else common.regWrite(s.r, ins.rm, ins.opsz, ins.pfx.rex != 0, v);
             } else {
                 const v = try rmRead(s, ins, ins.opsz);
@@ -1329,31 +1344,31 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
             if (ins.aux == 1) { // 66 0F D6: m64/xmm <- xmm low
                 const v = dst[0];
                 if (ins.mem) {
-                    try common.writeMem(s, ins.ea, 8, ins.pfx.seg, v);
+                    try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, v);
                 } else s.r.xmm[ins.rm] = .{ v, 0 };
             } else { // F3 0F 7E: xmm <- m64/xmm low
-                const v: u64 = if (ins.mem) try common.readMem(s, ins.ea, 8, ins.pfx.seg) else s.r.xmm[ins.rm][0];
+                const v: u64 = if (ins.mem) try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg) else s.r.xmm[ins.rm][0];
                 dst.* = .{ v, 0 };
             }
         },
         .movlps => {
             if (ins.aux == 1) {
                 if (!ins.mem) return common.ill(s, ins.raw);
-                try common.writeMem(s, ins.ea, 8, ins.pfx.seg, dst[0]);
+                try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, dst[0]);
             } else if (ins.md == 3) { // MOVHLPS
                 dst[0] = s.r.xmm[ins.rm][1];
             } else {
-                dst[0] = try common.readMem(s, ins.ea, 8, ins.pfx.seg);
+                dst[0] = try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg);
             }
         },
         .movhps => {
             if (ins.aux == 1) {
                 if (!ins.mem) return common.ill(s, ins.raw);
-                try common.writeMem(s, ins.ea, 8, ins.pfx.seg, dst[1]);
+                try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, dst[1]);
             } else if (ins.md == 3) { // MOVLHPS
                 dst[1] = s.r.xmm[ins.rm][0];
             } else {
-                dst[1] = try common.readMem(s, ins.ea, 8, ins.pfx.seg);
+                dst[1] = try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg);
             }
         },
         .movsldup => {
@@ -1658,10 +1673,10 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
             dst.* = fromU32s(r);
         },
         .ldmxcsr => {
-            const v = try common.readMem(s, ins.ea, 4, ins.pfx.seg);
+            const v = try common.readMem(s, eaOf(s, ins), 4, ins.pfx.seg);
             s.r.mxcsr = @truncate(v);
         },
-        .stmxcsr => try common.writeMem(s, ins.ea, 4, ins.pfx.seg, s.r.mxcsr),
+        .stmxcsr => try common.writeMem(s, eaOf(s, ins), 4, ins.pfx.seg, s.r.mxcsr),
         .paddb, .paddw, .paddd, .paddq, .paddsb, .paddsw, .paddusb, .paddusw, .psubb, .psubw, .psubd, .psubq, .psubsb, .psubsw, .psubusb, .psubusw => {
             dst.* = packAddSub(ins.sse, dst.*, try sseSrc(s, ins));
         },
@@ -2040,10 +2055,10 @@ fn packShift(op: Sse, v: Vec, count: u32) Vec {
 // ---- FXSAVE/FXRSTOR --------------------------------------------------------------
 
 fn xsaveWrite(s: St, ins: *const Insn, off: u64, v: u64) Error!void {
-    try common.writeMem(s, ins.ea + off, 8, ins.pfx.seg, v);
+    try common.writeMem(s, eaOf(s, ins) + off, 8, ins.pfx.seg, v);
 }
 fn xsaveRead(s: St, ins: *const Insn, off: u64) Error!u64 {
-    return common.readMem(s, ins.ea + off, 8, ins.pfx.seg);
+    return common.readMem(s, eaOf(s, ins) + off, 8, ins.pfx.seg);
 }
 
 fn fxsave(s: St, ins: *const Insn) Error!Exit {
@@ -2109,9 +2124,9 @@ fn fpuOp(s: St, ins: *const Insn) Error!Exit {
         .fild => {
             if (!ins.mem) return common.ill(s, ins.raw);
             const v: i64 = switch (ins.opsz) {
-                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg))))),
-                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg))))),
-                8 => @bitCast(try common.readMem(s, ins.ea, 8, ins.pfx.seg)),
+                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, eaOf(s, ins), 2, ins.pfx.seg))))),
+                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, eaOf(s, ins), 4, ins.pfx.seg))))),
+                8 => @bitCast(try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg)),
                 else => unreachable,
             };
             x87Push(s, @floatFromInt(v));
@@ -2120,9 +2135,9 @@ fn fpuOp(s: St, ins: *const Insn) Error!Exit {
             if (!ins.mem) return common.ill(s, ins.raw);
             const v: i64 = @intFromFloat(x87Round(r, x87Get(r, 0)));
             switch (ins.opsz) {
-                2 => try common.writeMem(s, ins.ea, 2, ins.pfx.seg, @as(u16, @truncate(@as(u64, @bitCast(@as(i64, @as(i16, @truncate(v)))))))),
-                4 => try common.writeMem(s, ins.ea, 4, ins.pfx.seg, @as(u32, @truncate(@as(u64, @bitCast(@as(i64, @as(i32, @truncate(v)))))))),
-                8 => try common.writeMem(s, ins.ea, 8, ins.pfx.seg, @bitCast(v)),
+                2 => try common.writeMem(s, eaOf(s, ins), 2, ins.pfx.seg, @as(u16, @truncate(@as(u64, @bitCast(@as(i64, @as(i16, @truncate(v)))))))),
+                4 => try common.writeMem(s, eaOf(s, ins), 4, ins.pfx.seg, @as(u32, @truncate(@as(u64, @bitCast(@as(i64, @as(i32, @truncate(v)))))))),
+                8 => try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, @bitCast(v)),
                 else => unreachable,
             }
             if (ins.fpu == .fistp) x87Pop(r);
@@ -2157,8 +2172,8 @@ fn fpuOp(s: St, ins: *const Insn) Error!Exit {
         .fiadd, .fisub, .fisubr, .fimul, .fidiv, .fidivr => {
             if (!ins.mem) return common.ill(s, ins.raw);
             const iv: i64 = switch (ins.opsz) {
-                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg))))),
-                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg))))),
+                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, eaOf(s, ins), 2, ins.pfx.seg))))),
+                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, eaOf(s, ins), 4, ins.pfx.seg))))),
                 else => unreachable,
             };
             const other: f80 = @floatFromInt(iv);
@@ -2210,16 +2225,16 @@ fn fpuOp(s: St, ins: *const Insn) Error!Exit {
         .fxam => x87Exam(r, x87Get(r, 0)),
         .fldcw => {
             if (!ins.mem) return common.ill(s, ins.raw);
-            r.fcw = @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg));
+            r.fcw = @truncate(try common.readMem(s, eaOf(s, ins), 2, ins.pfx.seg));
         },
         .fnstcw => {
             if (ins.mem) {
-                try common.writeMem(s, ins.ea, 2, ins.pfx.seg, r.fcw);
+                try common.writeMem(s, eaOf(s, ins), 2, ins.pfx.seg, r.fcw);
             } else return common.ill(s, ins.raw);
         },
         .fnstsw => {
             if (ins.mem) {
-                try common.writeMem(s, ins.ea, 2, ins.pfx.seg, r.fsw);
+                try common.writeMem(s, eaOf(s, ins), 2, ins.pfx.seg, r.fsw);
             } else {
                 common.regWrite(r, 0, 2, ins.pfx.rex != 0, r.fsw);
             }
@@ -2298,30 +2313,30 @@ inline fn x87Pop(r: *Regs) void {
 fn x87LoadMem(s: St, ins: *const Insn) Error!f80 {
     return switch (ins.aux) {
         3 => switch (ins.opsz) {
-            4 => @floatCast(@as(f32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg)))))),
-            8 => @floatCast(@as(f64, @bitCast(try common.readMem(s, ins.ea, 8, ins.pfx.seg)))),
+            4 => @floatCast(@as(f32, @bitCast(@as(u32, @truncate(try common.readMem(s, eaOf(s, ins), 4, ins.pfx.seg)))))),
+            8 => @floatCast(@as(f64, @bitCast(try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg)))),
             else => unreachable,
         },
         4 => blk: {
             const iv: i64 = switch (ins.opsz) {
-                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg))))),
-                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg))))),
+                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, eaOf(s, ins), 2, ins.pfx.seg))))),
+                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, eaOf(s, ins), 4, ins.pfx.seg))))),
                 else => unreachable,
             };
             break :blk @floatFromInt(iv);
         },
         5 => blk: {
             const iv: i64 = switch (ins.opsz) {
-                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, ins.ea, 2, ins.pfx.seg))))),
-                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, ins.ea, 4, ins.pfx.seg))))),
-                8 => @bitCast(try common.readMem(s, ins.ea, 8, ins.pfx.seg)),
+                2 => @as(i16, @bitCast(@as(u16, @truncate(try common.readMem(s, eaOf(s, ins), 2, ins.pfx.seg))))),
+                4 => @as(i32, @bitCast(@as(u32, @truncate(try common.readMem(s, eaOf(s, ins), 4, ins.pfx.seg))))),
+                8 => @bitCast(try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg)),
                 else => unreachable,
             };
             break :blk @floatFromInt(iv);
         },
         7 => blk: {
-            const lo = try common.readMem(s, ins.ea, 8, ins.pfx.seg);
-            const hi = try common.readMem(s, ins.ea + 8, 2, ins.pfx.seg);
+            const lo = try common.readMem(s, eaOf(s, ins), 8, ins.pfx.seg);
+            const hi = try common.readMem(s, eaOf(s, ins) + 8, 2, ins.pfx.seg);
             break :blk @bitCast((@as(u80, @truncate(hi)) << 64) | lo);
         },
         else => unreachable,
@@ -2331,23 +2346,23 @@ fn x87LoadMem(s: St, ins: *const Insn) Error!f80 {
 fn x87StoreMem(s: St, ins: *const Insn, v: f80) Error!void {
     switch (ins.aux) {
         3 => switch (ins.opsz) {
-            4 => try common.writeMem(s, ins.ea, 4, ins.pfx.seg, @as(u32, @bitCast(@as(f32, @floatCast(v))))),
-            8 => try common.writeMem(s, ins.ea, 8, ins.pfx.seg, @bitCast(@as(f64, @floatCast(v)))),
+            4 => try common.writeMem(s, eaOf(s, ins), 4, ins.pfx.seg, @as(u32, @bitCast(@as(f32, @floatCast(v))))),
+            8 => try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, @bitCast(@as(f64, @floatCast(v)))),
             else => unreachable,
         },
         5 => {
             const iv: i64 = @intFromFloat(x87Round(s.r, v));
             switch (ins.opsz) {
-                2 => try common.writeMem(s, ins.ea, 2, ins.pfx.seg, @as(u16, @truncate(@as(u64, @bitCast(@as(i64, @as(i16, @truncate(iv)))))))),
-                4 => try common.writeMem(s, ins.ea, 4, ins.pfx.seg, @as(u32, @truncate(@as(u64, @bitCast(@as(i64, @as(i32, @truncate(iv)))))))),
-                8 => try common.writeMem(s, ins.ea, 8, ins.pfx.seg, @bitCast(iv)),
+                2 => try common.writeMem(s, eaOf(s, ins), 2, ins.pfx.seg, @as(u16, @truncate(@as(u64, @bitCast(@as(i64, @as(i16, @truncate(iv)))))))),
+                4 => try common.writeMem(s, eaOf(s, ins), 4, ins.pfx.seg, @as(u32, @truncate(@as(u64, @bitCast(@as(i64, @as(i32, @truncate(iv)))))))),
+                8 => try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, @bitCast(iv)),
                 else => unreachable,
             }
         },
         7 => {
             const u: u80 = @bitCast(v);
-            try common.writeMem(s, ins.ea, 8, ins.pfx.seg, @truncate(u));
-            try common.writeMem(s, ins.ea + 8, 2, ins.pfx.seg, @truncate(u >> 64));
+            try common.writeMem(s, eaOf(s, ins), 8, ins.pfx.seg, @truncate(u));
+            try common.writeMem(s, eaOf(s, ins) + 8, 2, ins.pfx.seg, @truncate(u >> 64));
         },
         else => unreachable,
     }

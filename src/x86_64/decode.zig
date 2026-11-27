@@ -407,8 +407,6 @@ pub const Insn = struct {
     index: u4 = 0,
     scale: u3 = 0,
     disp: i64 = 0,
-    /// Effective address, filled in at the end of decode.
-    ea: u64 = 0,
     imm: u64 = 0,
     imm2: u64 = 0,
     /// Condition code (jcc/cmovcc/setcc) or an SSE comparison predicate.
@@ -496,26 +494,9 @@ const Dec = struct {
         }
     }
 
-    /// Effective address. `r.rip` is the next instruction's address by then
-    /// (run.zig advances it before exec; decode is called after).
-    fn finalizeEA(d: *Dec) void {
-        const ins = d.ins;
-        if (!ins.mem) return;
-        var ea: u64 = @bitCast(ins.disp);
-        if (ins.rip_rel) {
-            ea = d.s.r.rip +% d.n +% ea;
-        } else {
-            if (ins.has_base) ea +%= common.gpr(d.s.r, ins.base).*;
-            if (ins.has_index) ea +%= common.gpr(d.s.r, ins.index).* << ins.scale;
-        }
-        if (ins.addr32) ea &= 0xffff_ffff;
-        ins.ea = ea;
-    }
-
     fn finish(d: *Dec) void {
         d.ins.raw = d.raw;
         d.ins.len = d.n;
-        d.finalizeEA();
     }
 };
 

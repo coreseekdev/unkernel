@@ -491,7 +491,7 @@ pub const Cpu = extern struct {
     }
 
     /// Host address of `va` for an exec fetch.
-    inline fn execHost(self: *Cpu, va: u64) core.Error!u64 {
+    pub inline fn execHost(self: *Cpu, va: u64) core.Error!u64 {
         const vpn = va >> page_shift;
         const x = self.priv.tlb_x[2 * @as(usize, @intCast(vpn & (tlb_n - 1))) ..][0..2];
         if (x[0].tag == vpn) return va +% x[0].add;
@@ -537,7 +537,7 @@ pub const Cpu = extern struct {
     }
 
     /// Record that `mask` chunks of `page` hold decoded code.
-    fn markCode(self: *Cpu, page: u64, mask: u64) void {
+    pub fn markCode(self: *Cpu, page: u64, mask: u64) void {
         switch (self.markChunks(page, mask)) {
             .none => {},
             // Stores to this page must now take the slow path.
