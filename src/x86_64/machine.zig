@@ -32,6 +32,7 @@ pub const EV_ILLEGAL = 3;
 pub const EV_BREAKPOINT = 4;
 pub const EV_MISALIGNED = 5;
 pub const EV_INTERRUPT = 6;
+pub const EV_DIVIDE = 7;
 
 pub const Machine = struct {
     gpa: std.mem.Allocator,

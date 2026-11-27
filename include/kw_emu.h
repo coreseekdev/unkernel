@@ -166,6 +166,9 @@ enum kw_event_kind {
 				  (ev.addr = the address); pc at the
 				  instruction */
 	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
+	KW_EV_DIVIDE = 7,      /* #DE from DIV/IDIV (x86-64): zero divisor or
+				  quotient overflow; ev.insn = raw instruction. The
+				  kernel delivers SIGFPE/FPE_INTDIV, not SIGILL. */
 };
 
 enum kw_access {

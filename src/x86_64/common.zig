@@ -71,6 +71,14 @@ pub fn syscall(s: St) Exit {
     return .trap;
 }
 
+/// A #DE from DIV/IDIV (zero divisor or quotient overflow): SIGFPE.
+pub fn divideError(s: St, raw: u64) Exit {
+    @branchHint(.cold);
+    s.h.trap = .divide;
+    s.h.trap_val = raw;
+    return .trap;
+}
+
 pub fn breakpoint(s: St, raw: u64) Exit {
     s.h.trap = .breakpoint;
     s.h.trap_val = raw;

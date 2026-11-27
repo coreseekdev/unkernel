@@ -123,6 +123,7 @@ pub fn runRef(cpu: *Cpu, regs: *Regs) u32 {
                 return switch (h.trap) {
                     .breakpoint => event(cpu, .breakpoint, 0, ipc, h.trap_val),
                     .misaligned => event(cpu, .misaligned, 0, h.trap_val, 0),
+                    .divide => event(cpu, .divide, 0, ipc, h.trap_val),
                     else => event(cpu, .illegal, 0, ipc, h.trap_val),
                 };
             },

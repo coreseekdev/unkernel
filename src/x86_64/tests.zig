@@ -19,6 +19,7 @@ const EV_FAULT = mach.EV_FAULT;
 const EV_ILLEGAL = mach.EV_ILLEGAL;
 const EV_BREAKPOINT = mach.EV_BREAKPOINT;
 const EV_MISALIGNED = mach.EV_MISALIGNED;
+const EV_DIVIDE = mach.EV_DIVIDE;
 
 /// syscall
 const syscall = [_]u8{ 0x0f, 0x05 };
@@ -168,6 +169,42 @@ test "x86_64: inc/dec overflow at the signed edges" {
     m.regs.rax = 0;
     try t.expectEqual(EV_SYSCALL, m.run(100));
     try t.expectEqual(@as(u64, 0), m.regs.rax);
+}
+
+test "x86_64: 8-bit div/idiv divide AX into AL/AH and #DE" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.code(0x1000, &([_]u8{ 0xf6, 0xf2 } ++ syscall)); // div dl
+    m.code(0x2000, &([_]u8{ 0xf6, 0xfa } ++ syscall)); // idiv dl
+
+    // 12 / 4: quotient in AL, remainder in AH (not DX:AX).
+    m.regs.rax = 12;
+    m.regs.rdx = 4;
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual(@as(u64, 0x0003), m.regs.rax & 0xffff);
+
+    m.regs.rip = 0x1000;
+    m.regs.rax = 1000;
+    m.regs.rdx = 7;
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual(@as(u64, (6 << 8) | 142), m.regs.rax & 0xffff);
+
+    // IDIV: -100 / -7 = 14 remainder -2; AH = 0xfe, AL = 0x0e.
+    m.regs.rip = 0x2000;
+    m.regs.rax = 0xff9c;
+    m.regs.rdx = 0xf9;
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    try t.expectEqual(@as(u64, 0xfe0e), m.regs.rax & 0xffff);
+
+    // A zero divisor and a quotient that does not fit AL are #DE (SIGFPE).
+    m.regs.rip = 0x1000;
+    m.regs.rax = 12;
+    m.regs.rdx = 0;
+    try t.expectEqual(EV_DIVIDE, m.run(100));
+    m.regs.rip = 0x1000;
+    m.regs.rax = 0x0200;
+    m.regs.rdx = 1;
+    try t.expectEqual(EV_DIVIDE, m.run(100));
 }
 
 test "x86_64: shifts by imm and CL, sar sign fill" {

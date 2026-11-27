@@ -26,6 +26,8 @@ pub const Kind = enum(u32) {
     breakpoint = 4,
     misaligned = 5,
     interrupt = 6,
+    /// #DE from DIV/IDIV: the kernel delivers SIGFPE (x86-64).
+    divide = 7,
     /// Internal (never reported to the kernel): a counter read (MRS
     /// CNTVCT_EL0); the run loop supplies the count.
     counter = 0x100,

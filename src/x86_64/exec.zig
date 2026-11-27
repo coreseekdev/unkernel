@@ -465,23 +465,27 @@ fn mulDiv(s: St, ins: *const Insn) Error!Exit {
             s.r.eflags = (s.r.eflags & ~(state.CF | state.OF)) | (if (overflow) state.CF | state.OF else 0);
         },
         .div, .idiv => {
-            if (src == 0) return common.ill(s, ins.raw); // #DE
+            if (src == 0) return common.divideError(s, ins.raw);
             const a = common.regRead(s.r, 0, sz, ins.pfx.rex != 0);
             const d = common.regRead(s.r, 2, sz, ins.pfx.rex != 0);
             if (sz == 1 and ins.op == .div) {
-                const dividend: u16 = (@as(u16, @intCast(d & 0xff)) << 8) | @as(u8, @truncate(a));
+                // 8-bit DIV/IDIV divide AX, not DX:AX: quotient in AL,
+                // remainder in AH (the 16/32-bit forms use DX:AX/EDX:EAX).
+                const dividend: u16 = @truncate(s.r.rax);
                 const divisor: u16 = @intCast(src & 0xff);
                 const q = dividend / divisor;
                 const r = dividend % divisor;
-                if (q > 0xff) return common.ill(s, ins.raw);
-                s.r.rax = (s.r.rax & ~@as(u64, 0xffff)) | (@as(u64, q) << 8) | r;
+                if (q > 0xff) return common.divideError(s, ins.raw);
+                s.r.rax = (s.r.rax & ~@as(u64, 0xffff)) | (@as(u64, r) << 8) | q;
             } else if (sz == 1) {
-                const dividend: i16 = @bitCast((@as(u16, @intCast(d & 0xff)) << 8) | @as(u8, @truncate(a)));
-                const divisor: i16 = @bitCast(@as(u16, @intCast(src & 0xff)));
+                const dividend: i16 = @bitCast(@as(u16, @truncate(s.r.rax)));
+                const divisor: i16 = @bitCast(@as(u16, @truncate(common.sextR(src, 8))));
                 const q = @divTrunc(dividend, divisor);
                 const r = @rem(dividend, divisor);
-                if (q < -128 or q > 127) return common.ill(s, ins.raw);
-                s.r.rax = (s.r.rax & ~@as(u64, 0xffff)) | (@as(u64, @bitCast(@as(i64, q))) << 8) | (@as(u64, @bitCast(@as(i64, r))) & 0xff);
+                if (q < -128 or q > 127) return common.divideError(s, ins.raw);
+                s.r.rax = (s.r.rax & ~@as(u64, 0xffff)) |
+                    (@as(u64, @as(u8, @bitCast(@as(i8, @truncate(r))))) << 8) |
+                    @as(u8, @bitCast(@as(i8, @truncate(q))));
             } else if (sz == 2 or sz == 4) {
                 if (ins.op == .div) {
                     const dividend: u64 = ((d & m) << @intCast(bits)) | (a & m);

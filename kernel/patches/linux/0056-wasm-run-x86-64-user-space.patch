@@ -322,6 +322,9 @@ index 7db679113..5fa10fe0a 100644
 +				  (ev.addr = the address); pc at the
 +				  instruction */
  	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
++	KW_EV_DIVIDE = 7,      /* #DE from DIV/IDIV (x86-64): zero divisor or
++				  quotient overflow; ev.insn = raw instruction.
++				  The kernel delivers SIGFPE/FPE_INTDIV. */
  };
  
 @@ -172,7 +221,9 @@ void kw_cpu_init(struct kw_cpu *cpu);
@@ -1470,6 +1473,10 @@ index 525dacb6d..0e8a616f0 100644
 -			do_user_trap(regs, SIGTRAP, TRAP_BRKPT, regs->user.pc);
 +			do_user_trap(regs, SIGTRAP, TRAP_BRKPT, instruction_pointer(regs));
  			break;
++		case KW_EV_DIVIDE:
++			/* x86-64 #DE: a divide error is SIGFPE, unlike #UD. */
++			do_user_trap(regs, SIGFPE, FPE_INTDIV, instruction_pointer(regs));
++			break;
  		case KW_EV_MISALIGNED:
 +			#ifdef CONFIG_WASM_USER_X86_64
 +			/* x86-64: an aligned SSE access faults as SIGSEGV. */
