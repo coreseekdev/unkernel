@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-# Build a Debian trixie amd64 image that runs the x86-64 compatibility
-# suite (kw-init in this directory) instead of a desktop, and an erofs
+# Build a Debian trixie amd64 image (debian:trixie-slim already has bash,
+# perl-base, coreutils, tar/gzip and the loader) that runs the x86-64
+# compatibility suite (kw-init in this directory) instead of a desktop, and an erofs
 # image labelled kwroot for `js/cli.ts --distro`.
 #
 #   guest/distro/debian/compat/build.sh [ROOTFS_DIR] [IMAGE]
@@ -32,19 +33,24 @@ for g in inttest fptest sse2test strtest; do
 	}
 done
 
+# debian:trixie-slim already carries bash, perl (perl-base), coreutils,
+# find/diff, tar/gzip and the loader, which is everything the suite uses.
 docker rm -f "$container" >/dev/null 2>&1 || true
-docker run --name "$container" debian:trixie-slim bash -euxc '
-	apt-get update
-	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-		perl gawk findutils diffutils
-'
+docker run --name "$container" debian:trixie-slim true
 
 rm -rf "$out"
 mkdir -p "$out"
 docker export "$container" | sudo -n tar -xpf - -C "$out"
 docker rm -f "$container" >/dev/null
 
-sudo -n mkdir -p "$out/opt/compat"
+# Docker export leaves /dev empty; the suite and perl need the usual
+# character devices, and a native chroot needs them too (a container whose
+# device cgroup rejects mknod'ed nodes can bind-mount the host ones).
+sudo -n mkdir -p "$out/dev" "$out/opt/compat"
+for spec in "null 1 3" "zero 1 5" "random 1 8" "urandom 1 9"; do
+	set -- $spec
+	sudo -n mknod -m 666 "$out/dev/$1" c "$2" "$3" 2>/dev/null || true
+done
 for g in inttest fptest sse2test strtest; do
 	sudo -n cp "$root/zig-out/guest/x86_64/$g.elf" "$out/opt/compat/"
 done

@@ -1,7 +1,8 @@
 # Debian x86-64 compatibility suite
 
-`build.sh` builds a Debian trixie amd64 rootfs (Docker, `debian:trixie-slim`
-plus `perl`), installs the suite in `kw-init` as the image's init, copies the
+`build.sh` builds a Debian trixie amd64 rootfs (Docker, `debian:trixie-slim`,
+which already carries bash, perl-base, coreutils, tar/gzip and the loader),
+installs the suite in `kw-init` as the image's init, copies the
 static musl guests from `zig-out/guest/x86_64` into `/opt/compat`, and makes
 an erofs image labelled `kwroot`. The suite covers the shell, coreutils,
 tar/gzip, perl (arithmetic, strings, sort, FP, signals, fork, pipes, regex,
