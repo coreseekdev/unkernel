@@ -78,7 +78,11 @@ Done in this tree:
   was `PINSRW` ignoring imm[1:0] (it always wrote the first 16-bit word),
   which broke GCC's vectorized `ct_data` packing in zlib's `build_tree`:
   the dynamic Huffman trees were wrong, so the PNG's IDAT was an invalid
-  zlib stream even though the pixels were right.
+  zlib stream even though the pixels were right. SSE arithmetic and s/d
+  conversions went through host f32/f64 (round-to-nearest) and ignored
+  MXCSR, so `fesetround(FE_UPWARD)`/`fetestexcept` disagreed with native
+  (kwtest's FP hot loop); they now use `src/cpu/fpu.zig` with MXCSR.RC and
+  sticky flags, and `ldmxcsr`/`stmxcsr` decode (0F AE /2,/3).
 - **Kernel fixes in 0056:** x86-64 syscall restart used `orig_x0`
   (rdi, the first argument) as `rax`, so a futex wait interrupted by a
   signal restarted as a random syscall and glibc aborted with "The futex
@@ -109,22 +113,27 @@ Done in this tree:
   `pop [rsp]` (POP's address-after-increment rule), its integer division
   exposed DIV r/m8's AX dividend (AL/AH result), and its zlib tree
   builder exposed PINSRW's word selection. FCMOV (with the parity
-  conditions) is implemented for glibc's strtold. The interpreter is
+  conditions) is implemented for glibc's strtold. A real `apt-get install
+  hello` fetches, unpacks, configures and runs the program; the init must
+  run `/usr/lib/kw/rc` and `/usr/lib/kw/net` for DHCP. The interpreter is
   still the reference tier: the headless screenshot takes ~100 s of
   guest time (~0.4 s natively) on this host.
-- **Remaining phase 2 work:** `df` still reports "can't find mount
-  point"; x86-64 ptrace regsets and core-dump notes are not implemented
-  (`HAVE_ARCH_TRACEHOOK` stays off for x86); AVX/SSSE3/SSE4 are not
-  advertised (Debian's baseline glibc paths are used); the decoded-op
-  tier and wasm JIT are phase 4; riscv64 is phase 3. A user-visible
-  Firefox (display, input, sound) and the apt-get install path are next
-  after the headless screenshot.
+- **Remaining phase 2 work:** `kwtest` reports 0 failures on x86-64
+  (including its FP hot loop and thread/fork/signal checks); x86-64
+  ptrace regsets and core-dump notes are not implemented
+  (`HAVE_ARCH_TRACEHOOK` stays off for x86);
+  AVX/SSSE3/SSE4 are not advertised (Debian's baseline glibc paths are
+  used); the decoded-op tier and wasm JIT are phase 4; riscv64 is phase
+  3. A user-visible Firefox (display, input, sound) is next after the
+  headless screenshot. `df` works on the Debian trixie overlay root
+  (mountinfo carries the overlay entry); the old mount-point note no
+  longer reproduces.
 
-The apt cache and the headless Firefox screenshot are verified. The next
-round is a user-visible Firefox (display/input), a real apt-get install
-(not just -s), and threads/futex/signal conformance with kwtest/abitest
-before the decoded-op tier. Keep the reference interpreter as the oracle
-for the tier and reuse the guest corpus.
+The apt cache, a real apt install, the headless Firefox screenshot and
+kwtest are verified. The next round is a user-visible Firefox
+(display/input) and the x86-64 ptrace/core-dump pieces before the
+decoded-op tier. Keep the reference interpreter as the oracle for the
+tier and reuse the guest corpus.
 
 ## 1. Objective and priorities
 

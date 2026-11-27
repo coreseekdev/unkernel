@@ -4590,7 +4590,7 @@ static void *hot_thread(void *arg)
 int main(int argc, char **argv)
 {
 	struct utsname u;
-	const char msg[] = "hello from aarch64 user mode via write()\n";
+	const char msg[] = "hello from user mode via write()\n";
 
 	if (argc > 1 && !strcmp(argv[1], "child"))
 		return 7;	/* exec'd by the execve test */
@@ -4640,7 +4640,11 @@ int main(int argc, char **argv)
 	write(1, msg, sizeof(msg) - 1);
 
 	uname(&u);
+#if defined(__x86_64__)
+	CHECK(!strcmp(u.machine, "x86_64"), "uname: %s %s %s", u.sysname, u.release, u.machine);
+#else
 	CHECK(!strcmp(u.machine, "aarch64"), "uname: %s %s %s", u.sysname, u.release, u.machine);
+#endif
 	CHECK(getpid() == 1 || getppid() > 0, "getpid = %d", getpid());
 #ifdef __aarch64__
 	isa_checks();

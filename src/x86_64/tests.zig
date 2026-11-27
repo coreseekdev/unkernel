@@ -349,6 +349,24 @@ test "x86_64: pinsrw selects every 16-bit word" {
     for (want, 0..) |w, i| try t.expectEqual(w, got[i]);
 }
 
+test "x86_64: ldmxcsr and stmxcsr" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.mapData(0x80000, 1);
+    const v: u32 = 0x9fc0;
+    @memcpy(m.at(0x80000)[0..4], std.mem.asBytes(&v));
+    m.code(0x1000, &([_]u8{
+        // ldmxcsr [0x80000]; stmxcsr [0x80010]
+        0x0f, 0xae, 0x14, 0x25, 0x00, 0x00, 0x08, 0x00,
+        0x0f, 0xae, 0x1c, 0x25, 0x10, 0x00, 0x08, 0x00,
+    } ++ syscall));
+    try t.expectEqual(EV_SYSCALL, m.run(100));
+    var got: u32 = undefined;
+    @memcpy(std.mem.asBytes(&got), m.at(0x80010)[0..4]);
+    try t.expectEqual(v, got);
+    try t.expectEqual(v, m.regs.mxcsr);
+}
+
 test "x86_64: memory forms (SIB, disp, RIP-relative), movzx/movsx/lea" {
     var m = try Machine.init(t.allocator);
     defer m.deinit();

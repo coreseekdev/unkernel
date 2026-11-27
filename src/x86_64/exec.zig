@@ -14,6 +14,7 @@ comptime {
     _ = @import("x87rt.zig");
 }
 const state = @import("state.zig");
+const fpu = @import("../cpu/fpu.zig");
 
 const Insn = decode.Insn;
 const Op = decode.Op;
@@ -1236,6 +1237,26 @@ fn roundEven(x: f64) f64 {
     return if (@mod(fl, 2) == 0) fl else fl + 1;
 }
 
+/// The SSE rounding mode from MXCSR.RC (bits 13:14).
+fn mxcsrRm(r: *const Regs) u32 {
+    return switch ((r.mxcsr >> 13) & 3) {
+        0 => fpu.RNE,
+        1 => fpu.RDN,
+        2 => fpu.RUP,
+        else => fpu.RTZ,
+    };
+}
+
+/// Fold the softfloat exception flags into MXCSR's sticky bits
+/// (IE DE ZE OE UE PE = bits 0..5).
+fn mxcsrFlags(r: *Regs, fl: u32) void {
+    if (fl & fpu.NV != 0) r.mxcsr |= 0x01;
+    if (fl & fpu.DZ != 0) r.mxcsr |= 0x04;
+    if (fl & fpu.OF != 0) r.mxcsr |= 0x08;
+    if (fl & fpu.UF != 0) r.mxcsr |= 0x10;
+    if (fl & fpu.NX != 0) r.mxcsr |= 0x20;
+}
+
 fn sseOp(s: St, ins: *const Insn) Error!Exit {
     const dst = &s.r.xmm[ins.reg];
     const imm = @as(u8, @truncate(ins.imm));
@@ -1467,15 +1488,18 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
                 return .next;
             }
             var r = a;
+            var fl: u32 = 0;
+            const rm = mxcsrRm(s.r);
             r[0] = switch (ins.sse) {
-                .addss => a[0] + b[0],
-                .subss => a[0] - b[0],
-                .mulss => a[0] * b[0],
-                .divss => a[0] / b[0],
+                .addss => @bitCast(fpu.F32.add(@bitCast(a[0]), @bitCast(b[0]), rm, &fl)),
+                .subss => @bitCast(fpu.F32.sub(@bitCast(a[0]), @bitCast(b[0]), rm, &fl)),
+                .mulss => @bitCast(fpu.F32.mul(@bitCast(a[0]), @bitCast(b[0]), rm, &fl)),
+                .divss => @bitCast(fpu.F32.div(@bitCast(a[0]), @bitCast(b[0]), rm, &fl)),
                 .minss => minx(a[0], b[0]),
                 .maxss => maxx(a[0], b[0]),
-                else => @sqrt(b[0]),
+                else => @bitCast(fpu.F32.sqrt(@bitCast(b[0]), rm, &fl)),
             };
+            mxcsrFlags(s.r, fl);
             dst.* = fromF32s(r);
         },
         .addsd, .subsd, .mulsd, .divsd, .minsd, .maxsd, .sqrtsd, .cmpsd => {
@@ -1486,15 +1510,18 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
                 dst.* = .{ if (cmpF64(imm, a[0], b[0]) != 0) 0xffff_ffff_ffff_ffff else 0, cur[1] };
                 return .next;
             }
+            var fl: u32 = 0;
+            const rm = mxcsrRm(s.r);
             a[0] = switch (ins.sse) {
-                .addsd => a[0] + b[0],
-                .subsd => a[0] - b[0],
-                .mulsd => a[0] * b[0],
-                .divsd => a[0] / b[0],
+                .addsd => @bitCast(fpu.F64.add(@bitCast(a[0]), @bitCast(b[0]), rm, &fl)),
+                .subsd => @bitCast(fpu.F64.sub(@bitCast(a[0]), @bitCast(b[0]), rm, &fl)),
+                .mulsd => @bitCast(fpu.F64.mul(@bitCast(a[0]), @bitCast(b[0]), rm, &fl)),
+                .divsd => @bitCast(fpu.F64.div(@bitCast(a[0]), @bitCast(b[0]), rm, &fl)),
                 .minsd => minxD(a[0], b[0]),
                 .maxsd => maxxD(a[0], b[0]),
-                else => @sqrt(b[0]),
+                else => @bitCast(fpu.F64.sqrt(@bitCast(b[0]), rm, &fl)),
             };
+            mxcsrFlags(s.r, fl);
             dst.* = fromF64s(a);
         },
         .andps, .andpd => {
@@ -1538,16 +1565,22 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
         },
         .cvtsi2ss => {
             const iv = try rmRead(s, ins, ins.opsz);
-            const x: f32 = @floatFromInt(@as(i64, @bitCast(common.sextR(iv, ins.opsz * 8))));
+            const sv = common.sextR(iv, ins.opsz * 8);
+            var fl: u32 = 0;
+            const x = fpu.F32.fromInt(sv >> 63 != 0, if (sv >> 63 != 0) 0 -% sv else sv, mxcsrRm(s.r), &fl);
+            mxcsrFlags(s.r, fl);
             var r = f32s(dst.*);
-            r[0] = x;
+            r[0] = @bitCast(x);
             dst.* = fromF32s(r);
         },
         .cvtsi2sd => {
             const iv = try rmRead(s, ins, ins.opsz);
-            const x: f64 = @floatFromInt(@as(i64, @bitCast(common.sextR(iv, ins.opsz * 8))));
+            const sv = common.sextR(iv, ins.opsz * 8);
+            var fl: u32 = 0;
+            const x = fpu.F64.fromInt(sv >> 63 != 0, if (sv >> 63 != 0) 0 -% sv else sv, mxcsrRm(s.r), &fl);
+            mxcsrFlags(s.r, fl);
             var r = f64s(dst.*);
-            r[0] = x;
+            r[0] = @bitCast(x);
             dst.* = fromF64s(r);
         },
         .cvttss2si, .cvtss2si, .cvttsd2si, .cvtsd2si => {
@@ -1558,25 +1591,34 @@ fn sseOp(s: St, ins: *const Insn) Error!Exit {
             var iv: i64 = undefined;
             if (std.math.isNan(f)) {
                 iv = if (sz == 8) std.math.minInt(i64) else std.math.minInt(i32);
+                s.r.mxcsr |= 0x01;
             } else {
                 const r = if (trunc) @trunc(f) else roundEven(f);
                 const limit: f64 = if (sz == 8) 9.2233720368547758e18 else 2147483648.0;
                 if (r >= limit or r < -limit) {
                     iv = if (sz == 8) std.math.minInt(i64) else std.math.minInt(i32);
+                    s.r.mxcsr |= 0x01;
                 } else iv = @intFromFloat(r);
+                if (r != f) s.r.mxcsr |= 0x20;
             }
             common.regWrite(s.r, ins.reg, sz, ins.pfx.rex != 0, @bitCast(iv));
         },
         .cvtss2sd => {
             const f = f32s(try sseSrc(s, ins))[0];
+            var fl: u32 = 0;
+            const d = fpu.F64.fromOther(u32, @as(u32, @bitCast(f)), mxcsrRm(s.r), &fl);
+            mxcsrFlags(s.r, fl);
             var r = f64s(dst.*);
-            r[0] = f;
+            r[0] = @bitCast(d);
             dst.* = fromF64s(r);
         },
         .cvtsd2ss => {
             const f = f64s(try sseSrc(s, ins))[0];
+            var fl: u32 = 0;
+            const sb = fpu.F32.fromOther(u64, @as(u64, @bitCast(f)), mxcsrRm(s.r), &fl);
+            mxcsrFlags(s.r, fl);
             var r = f32s(dst.*);
-            r[0] = @floatCast(f);
+            r[0] = @bitCast(sb);
             dst.* = fromF32s(r);
         },
         .cvtdq2ps => {

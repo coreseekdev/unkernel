@@ -1011,13 +1011,21 @@ fn twoByte(d: *Dec) common.DecodeError!void {
                 };
             } else if (ins.opx == 7) {
                 ins.op = .nop; // clflush
-            } else ins.op = switch (ins.opx) {
-                0 => .fxsave,
-                1 => .fxrstor,
-                4 => .xsave,
-                5 => .xrstor,
+            } else switch (ins.opx) {
+                0 => ins.op = .fxsave,
+                1 => ins.op = .fxrstor,
+                2 => {
+                    ins.op = .sse;
+                    ins.sse = .ldmxcsr;
+                },
+                3 => {
+                    ins.op = .sse;
+                    ins.sse = .stmxcsr;
+                },
+                4 => ins.op = .xsave,
+                5 => ins.op = .xrstor,
                 else => return common.invalid(d.s, d.raw),
-            };
+            }
         },
         0xaf => {
             try d.modrm();
