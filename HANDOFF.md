@@ -125,9 +125,10 @@ Done in this tree:
   AVX/SSSE3/SSE4 are not advertised (Debian's baseline glibc paths are
   used); the decoded-op tier and wasm JIT are phase 4; riscv64 is phase
   3. A user-visible Firefox (display, input, sound) is next after the
-  headless screenshot. `df` works on the Debian trixie overlay root
-  (mountinfo carries the overlay entry); the old mount-point note no
-  longer reproduces.
+  headless screenshot. The page's Wayland path needs an x86-64 `wlandr`
+  relay; `pins-x86_64.sh` pins none yet (the A64 pin set has one), and
+  X11 on kwfb is the alternative. `df` works on the Debian trixie overlay
+  root; the old mount-point note no longer reproduces.
 
 The apt cache, a real apt install, the headless Firefox screenshot and
 kwtest are verified. The next round is a user-visible Firefox
